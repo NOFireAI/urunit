@@ -69,6 +69,7 @@ int mount_block_vols(struct block_config **vols);
 int set_default_route(void);
 void unmount_external(void);
 int set_subreaper(void);
+int setup_controlling_tty(void);
 void request_reboot(void);
 
 #endif // COMMON_H

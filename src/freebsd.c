@@ -733,6 +733,12 @@ int set_subreaper(void) {
 	return 0;
 }
 
+// setup_controlling_tty: Not implemented on FreeBSD. The caller falls back to
+// a plain process group, so the application runs without job control.
+int setup_controlling_tty(void) {
+	return -1;
+}
+
 // request_reboot: Resets the VM. Firecracker terminates when the guest
 // resets; QEMU does the same when started with -no-reboot.
 void request_reboot(void) {
