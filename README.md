@@ -19,8 +19,8 @@ The key features of `urunit` are:
 - Reading and mounting attached block devices defined in the configuration file.
 - Starting the agent at `/run/urunc/urunit-agent`, when present, as its own
   child before the application (e.g. the `urunc exec` agent) and reaping it.
-  Once the application exits the agent is sent `SIGTERM`, and `urunit` waits,
-  as always, for every remaining child before shutting down.
+  Once the application exits the agent is sent `SIGTERM` and the shutdown
+  begins; it is not waited for, nor is anything else the guest still runs.
 - Stopping the application with `SIGTERM` when the ACPI power button of the VM
   is pressed (x86), and then powering the VM off instead of restarting it.
 
