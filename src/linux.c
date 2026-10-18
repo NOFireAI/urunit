@@ -173,6 +173,14 @@ int find_vblock_device_by_serial(const char *target_serial, char *device_path) {
 	return -1;
 }
 
+// already_mounted: Tells whether a failed mount of procfs or sysfs does not
+// matter, because the filesystem is there already. A process that may not
+// mount (a user without CAP_SYS_ADMIN, as when the tests run the supervisor)
+// still finds what it needs under <probe>.
+static int already_mounted(const char *probe) {
+	return errno == EPERM && access(probe, F_OK) == 0;
+}
+
 // tmp_is_mounted: Tells whether /tmp is a mount point, i.e. lives on another
 // device than its parent.
 static int tmp_is_mounted(void) {
@@ -190,7 +198,7 @@ static int tmp_is_mounted(void) {
 // In a generic container boot the early init has already mounted both in the
 // new root before it hands over to the supervisor. Mounting the same procfs or
 // sysfs again on top of itself fails with EBUSY, which therefore means that the
-// filesystem is already there.
+// filesystem is already there. So does EPERM, when the filesystem is usable.
 //
 // It also mounts a tmpfs on /tmp, unless /tmp is a mount point already. The
 // early init of a container boot mounts one when it stages urunit.conf, and
@@ -210,7 +218,7 @@ int mount_special_fs(void) {
 		return 1;
 	}
 	ret = mount("proc", "/proc", "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
-	if (ret < 0 && errno != EBUSY) {
+	if (ret < 0 && errno != EBUSY && !already_mounted("/proc/self")) {
 		perror("mount /proc");
 		return 1;
 	}
@@ -220,7 +228,7 @@ int mount_special_fs(void) {
 		return 1;
 	}
 	ret = mount("sysfs", "/sys", "sysfs", 0, NULL);
-	if (ret < 0 && errno != EBUSY) {
+	if (ret < 0 && errno != EBUSY && !already_mounted("/sys/kernel")) {
 		perror("mount /sys");
 		return 1;
 	}
@@ -562,6 +570,11 @@ char *read_raw_device(int fd, size_t *size) {
 	return buffer;
 }
 
+int reboot_command(void) {
+	return getenv("URUNIT_POWEROFF") != NULL ? LINUX_REBOOT_CMD_POWER_OFF
+						 : LINUX_REBOOT_CMD_RESTART;
+}
+
 // setup_console: On Linux the kernel opens the console for init.
 int setup_console(void) {
 	return 0;
@@ -593,10 +606,7 @@ void request_reboot(void) {
 	// Hypervisor instead restarts the VM on a reset, so when urunc sets
 	// URUNIT_POWEROFF the guest powers off (ACPI) instead, which Cloud Hypervisor
 	// turns into a clean exit. Power off needs ACPI in the guest kernel.
-	int cmd = LINUX_REBOOT_CMD_RESTART;
-	if (getenv("URUNIT_POWEROFF") != NULL) {
-		cmd = LINUX_REBOOT_CMD_POWER_OFF;
-	}
+	int cmd = reboot_command();
 	syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
 		cmd, NULL);
 }

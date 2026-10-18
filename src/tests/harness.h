@@ -73,5 +73,6 @@ int run_init_tests(void);
 int run_config_tests(void);
 int run_agent_tests(void);
 int run_reap_tests(void);
+int run_guard_tests(void);
 
 #endif // URUNIT_TESTS_HARNESS_H

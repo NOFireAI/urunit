@@ -1432,12 +1432,26 @@ static int should_spawn_agent(void) {
 #endif
 }
 
+// wants_default_route: Tells whether URUNIT_DEFROUTE is set, in the
+// environment or as a boot variable (FreeBSD).
+int wants_default_route(void) {
+	char *val = NULL;
+	int set = 0;
+
+	if (getenv("URUNIT_DEFROUTE") != NULL) {
+		return 1;
+	}
+	val = get_boot_var("URUNIT_DEFROUTE");
+	set = val != NULL;
+	free(val);
+
+	return set;
+}
+
 int supervise_main(int argc, char *argv[]) {
 	pid_t app_pid;
 	int ret = 0;
 	int app_exitcode = -1;
-	char *should_set_def_route = NULL;
-	uint8_t free_boot_var = 0;
 
 	// When started by the kernel as init we may have no console yet.
 	setup_console();
@@ -1446,20 +1460,12 @@ int supervise_main(int argc, char *argv[]) {
 	// read-write for the application, regardless of the configuration.
 	remount_root_rw();
 
-	should_set_def_route = getenv("URUNIT_DEFROUTE");
-	if (!should_set_def_route) {
-		should_set_def_route = get_boot_var("URUNIT_DEFROUTE");
-		free_boot_var = 1;
-	}
-	if (should_set_def_route) {
+	if (wants_default_route()) {
 		DEBUG_PRINT("URUNIT_DEFROUTE was set\n");
 		ret = set_default_route();
 		if (ret != 0) {
 			fprintf(stderr, "Failed to set default route\n");
 		}
-	}
-	if (free_boot_var) {
-		free(should_set_def_route);
 	}
 
 	DEBUG_PRINT("Setting subreaper\n");

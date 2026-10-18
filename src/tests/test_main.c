@@ -60,6 +60,7 @@ int main(void)
 		{ "config", run_config_tests },
 		{ "agent", run_agent_tests },
 		{ "reap", run_reap_tests },
+		{ "guards", run_guard_tests },
 	};
 	size_t i;
 

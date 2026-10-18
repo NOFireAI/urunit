@@ -59,7 +59,65 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	     char ***out_argv);
 
 // Moves newroot onto / and deletes the old initramfs, like switch_root(8).
-// It refuses to run when / is not a ramfs or tmpfs.
+// It refuses to run when / is not a ramfs or tmpfs, or when newroot is not
+// a mount point. The deletion never crosses into another filesystem.
 int sysops_switch_root_real(const char *newroot);
+// Deletes the tree under the directory fd, skipping every entry on a device
+// other than rootdev. It takes ownership of fd.
+void sysops_rm_tree(int fd, dev_t rootdev);
+
+// The helpers below are part of init_run. They are exported for the unit
+// tests.
+
+// One line of /urunc-mounts: a virtiofs tag, its absolute path in the guest
+// and whether it is mounted read-only.
+struct init_mount {
+	char *tag;
+	char *dest;
+	int ro;
+};
+
+// Finds root=, rootfstype= and rootflags= in a kernel command line. The
+// parameters after "--" belong to the application and are not looked at.
+// Each output is a heap string, or NULL when the parameter is absent.
+// Returns 0, or -1 when memory runs out.
+int init_parse_cmdline_root(const char *cmdline, char **root, char **fstype,
+			    char **flags);
+
+// Splits buf into lines. A trailing newline adds no empty line. Returns a
+// NULL terminated, heap allocated vector, or NULL when memory runs out.
+char **init_read_lines(const char *buf, size_t len);
+
+// Frees a vector from init_read_lines.
+void init_free_lines(char **lines);
+
+// Parses /urunc-mounts, one "<tag>\t<dest>\t<ro|rw>" per line. Lines without
+// a tag or a dest are skipped. Returns an array that ends with an entry
+// whose tag is NULL, or NULL when memory runs out.
+struct init_mount *init_parse_mounts_tsv(const char *buf, size_t len);
+
+// Frees an array from init_parse_mounts_tsv.
+void init_free_mounts(struct init_mount *mounts);
+
+// Returns the nameserver, domain and search lines of /proc/net/pnp as a
+// heap string, or NULL when there is no nameserver line.
+char *init_pnp_resolv(const char *buf, size_t len);
+
+// Returns the absolute path of a bare command name, found in the standard
+// directories under newroot. An absolute command, or one that is not found,
+// comes back unchanged. The result is a heap string, or NULL when memory
+// runs out.
+char *init_resolve_command(const struct sysops *ops, const char *newroot,
+			   const char *cmd);
+
+// Exports every KEY=VALUE line of buf with ops->setenv. Blank lines and
+// lines that start with '#' are skipped. Returns 0, or -1 when a setenv
+// failed.
+int init_env_export(const struct sysops *ops, const char *buf);
+
+// Splits mount options into MS_* flags, added to *flags, and the options
+// left for the filesystem. Returns those as a heap string, or NULL when
+// there are none.
+char *init_mount_opts(const char *opts, unsigned long *flags);
 
 #endif // URUNIT_SYSOPS_H

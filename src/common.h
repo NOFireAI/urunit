@@ -75,6 +75,11 @@ void unmount_external(void);
 int set_subreaper(void);
 int setup_controlling_tty(void);
 void request_reboot(void);
+// The reboot(2) command request_reboot uses: LINUX_REBOOT_CMD_POWER_OFF when
+// URUNIT_POWEROFF is set, LINUX_REBOOT_CMD_RESTART otherwise.
+int reboot_command(void);
+// Nonzero when URUNIT_DEFROUTE asks for a default route through the gateway.
+int wants_default_route(void);
 
 // configuration
 //
