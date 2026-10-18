@@ -1,0 +1,46 @@
+name: Unit tests
+
+# Builds urunit and runs the C unit tests (make check) with glibc on the
+# Ubuntu runners and with musl in Alpine, as the images ship it. FreeBSD is
+# built by the image workflows.
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "staging"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check (${{ matrix.libc }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+        libc: [glibc, musl]
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and test with glibc
+        if: matrix.libc == 'glibc'
+        run: make static check
+
+      - name: Build and test with musl
+        if: matrix.libc == 'musl'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src docker.io/library/alpine:3.20 \
+            sh -c 'apk add -q build-base linux-headers && make static check BUILD_DIR=/tmp/dist'
