@@ -40,8 +40,12 @@
 //
 // For more information, please check https://github.com/krallin/tini/blob/master/LICENSE
 
+// The supervisor (PID 1) of the application. main() is in urunit.c, which
+// calls supervise_main() when urunit runs under its own name.
+
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -49,27 +53,21 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
+#include "agentlog.h"
 #include "common.h"
+#include "urunit.h"
 
 #define STATUS_MAX 255
 #define STATUS_MIN 0
 
-struct process_config {
-	uint32_t uid;
-	uint32_t gid;
-	char     *wdir;
-	uint32_t argc;
-	char     **argv;
-};
+// The maximum length of an argument that spawn_app reassembles from quoted
+// words of the command line, including its NUL.
+#define QUOTED_ARG_MAX 1024
 
-struct app_exec_config {
-	char	 **envs;
-	char	 *path_env;
-	struct process_config *pr_conf;
-	struct block_config **blk_conf;
-	struct net_config *net_conf;
-};
+// The pid of the agent urunit started, 0 when there is none or it was reaped.
+static pid_t agent_pid = 0;
 
 extern char **environ;
 
@@ -248,12 +246,7 @@ char *read_file_and_size(char *file, size_t *size) {
 // where the records are separated with new lines instead.
 #define CONFIG_MAGIC "URUNIT1"
 
-// record_iter: Iterates over the NUL-terminated records of the configuration,
-// starting at pos and stopping at end.
-struct record_iter {
-	char *pos;
-	char *end;
-};
+// struct record_iter is declared in common.h.
 
 // next_record: Returns the next non-empty record and moves the iterator past
 // it. Empty records carry no information (e.g. the zero padding of a raw block
@@ -369,7 +362,7 @@ int parse_envs(struct record_iter *iter, char ***envs, char **path_env) {
 	return -1;
 }
 
-// get_uint_val: Converst the value of "KEY: VALUE" string  to uint32_t
+// get_uint_val: Converts the value of "KEY: VALUE" string  to uint32_t
 //
 // Arguments:
 // 1. str:	The string to convert in the form "KEY: VAL"
@@ -406,7 +399,7 @@ int get_uint_val(char *str, uint32_t *value) {
 		return -1;
 	}
 	if (*end != '\0') {
-		fprintf(stderr, "Failed to convert %s to unit32_t. Got trailing character %c\n", val_str, *end);
+		fprintf(stderr, "Failed to convert %s to uint32_t. Got trailing character %c\n", val_str, *end);
 		return -1;
 	}
 
@@ -492,19 +485,19 @@ int parse_process_config(struct record_iter *iter, struct process_config **pconf
 		if (is_field(rec, "UID")) {
 			ret = get_uint_val(rec, &(conf->uid));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive UID information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve UID information from %s\n", rec);
 				break;
 			}
 		} else if (is_field(rec, "GID")) {
 			ret = get_uint_val(rec, &(conf->gid));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive GID information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve GID information from %s\n", rec);
 				break;
 			}
 		} else if (is_field(rec, "WD")) {
 			ret = get_string_val(rec, &(conf->wdir));
 			if (ret != 0) {
-				fprintf(stderr, "Failed to retreive WD information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve WD information from %s\n", rec);
 				break;
 			}
 		} else if (is_field(rec, "ARC")) {
@@ -583,7 +576,7 @@ int parse_net_config(struct record_iter *iter, struct net_config **nconf) {
 		return -1;
 	}
 	memset(conf, 0, sizeof(struct net_config));
-	// just for snaity
+	// just for sanity
 	conf->ip = NULL;
 	conf->gateway = NULL;
 	conf->mask = NULL;
@@ -596,19 +589,19 @@ int parse_net_config(struct record_iter *iter, struct net_config **nconf) {
 			ret = get_string_val(rec, &(conf->ip));
 			if (ret != 0) {
 				conf->ip = NULL;
-				fprintf(stderr, "Failed to retreive IP information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve IP information from %s\n", rec);
 			}
 		} else if (is_field(rec, "GW")) {
 			ret = get_string_val(rec, &(conf->gateway));
 			if (ret != 0) {
 				conf->gateway = NULL;
-				fprintf(stderr, "Failed to retreive GW information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve GW information from %s\n", rec);
 			}
 		} else if (is_field(rec, "MSK")) {
 			ret = get_string_val(rec, &(conf->mask));
 			if (ret != 0) {
 				conf->mask = NULL;
-				fprintf(stderr, "Failed to retreive MSK information from %s\n", rec);
+				fprintf(stderr, "Failed to retrieve MSK information from %s\n", rec);
 			}
 		} else if (strcmp(rec, "UNE") == 0) {
 			DEBUG_PRINTF("Found network config ip=%s gw=%s mask=%s\n",
@@ -728,6 +721,23 @@ parse_block_config_free:
 	free(cur);
 	free_block_config(bentries);
 	return -1;
+}
+
+// free_app_config: Frees a configuration returned by get_config_from_file.
+// The buffer of the configuration is not part of it and is freed separately.
+//
+// Arguments:
+// 1. config:	The configuration to free. It can be NULL.
+void free_app_config(struct app_exec_config *config) {
+	if (!config)
+		return;
+	free(config->envs);
+	if (config->pr_conf)
+		free(config->pr_conf->argv);
+	free(config->pr_conf);
+	free_block_config(config->blk_conf);
+	free(config->net_conf);
+	free(config);
 }
 
 // get_config_from_file: Reads the contents of <file> and parses the
@@ -851,9 +861,8 @@ get_env_vars_error_free:
 }
 
 // load_app_config: Reads the urunit configuration, if any. The configuration
-// file is given with the URUNIT_CONFIG environment variable or, when the
-// guest passes boot parameters through the kernel environment (FreeBSD), with
-// the URUNIT_CONFIG kernel environment variable.
+// file is given with the URUNIT_CONFIG environment variable, or with the boot
+// variable of the same name on platforms that have them (FreeBSD).
 //
 // Arguments:
 // 1. config:		Will hold the parsed configuration, or stay untouched if
@@ -866,8 +875,8 @@ get_env_vars_error_free:
 // Otherwise 1 is returned.
 int load_app_config(struct app_exec_config **config, char **config_buf) {
 	char *config_file = NULL;
-	int ret = 0;
 	uint8_t free_boot_var = 0;
+	int ret = 0;
 
 	config_file = getenv("URUNIT_CONFIG");
 	if (!config_file) {
@@ -876,8 +885,7 @@ int load_app_config(struct app_exec_config **config, char **config_buf) {
 	}
 	if (!config_file) {
 		DEBUG_PRINT("No configuration file\n");
-		ret = 0;
-		goto exit_load_app_config;
+		return 0;
 	}
 
 	// We need to mount sysfs to read the data from retained initrd
@@ -885,17 +893,18 @@ int load_app_config(struct app_exec_config **config, char **config_buf) {
 	if (ret != 0) {
 		fprintf(stderr, "Failed to mount special filesystems\n");
 		ret = 1;
-		goto exit_load_app_config;
+		goto out;
 	}
 	*config = get_config_from_file(config_file, config_buf);
 	if (!*config) {
 		fprintf(stderr, "Failed to read the configuration from %s\n", config_file);
 		ret = 1;
 	}
-
-exit_load_app_config:
-	if (free_boot_var)
+out:
+	if (free_boot_var) {
 		free(config_file);
+	}
+
 	return ret;
 }
 
@@ -960,7 +969,7 @@ int manual_execvpe(const char *env_path, const char *file_bin, char *const argv[
 	}
 
 	// Store the basename of the executable in the end of the buffer
-	// and prepend the '/' character to prepare a concatination of a
+	// and prepend the '/' character to prepare a concatenation of a
 	// path from custom PATH and the basename of the executable
 	// This will reduce the copies, since we only change the directory
 	// that we try out each time.
@@ -1108,7 +1117,8 @@ int child_func(int argc, char *argv[]) {
 		return 1;
 	}
 
-	// Configure the network if the configuration provides it.
+	// Configure the network if the configuration provides it. On Linux the
+	// kernel configures it through the ip= boot parameter and this is a no-op.
 	if (app_config && app_config->net_conf) {
 		DEBUG_PRINT("Configuring the network\n");
 		if (configure_network(app_config->net_conf) != 0) {
@@ -1116,9 +1126,9 @@ int child_func(int argc, char *argv[]) {
 		}
 	}
 
-	// No command line (e.g. started by the FreeBSD kernel as init): take the
-	// application command from the configuration, where every argument is
-	// already separated and the array is NULL terminated.
+	// No command line: take the application command from the
+	// configuration, where every argument is already separated and the
+	// array is NULL terminated.
 	if (argc < 2 && app_config && app_config->pr_conf &&
 	    app_config->pr_conf->argv && app_config->pr_conf->argc > 0) {
 		DEBUG_PRINT("Taking the application command from the configuration\n");
@@ -1158,44 +1168,66 @@ int child_func(int argc, char *argv[]) {
 	}
 	// If we returned something went wrong
 child_func_free:
-	if (app_config) {
-		free(app_config->envs);
-		if (app_config->pr_conf)
-			free(app_config->pr_conf->argv);
-		free(app_config->pr_conf);
-		free_block_config(app_config->blk_conf);
-		free(app_config->net_conf);
-		free(app_config);
-	}
+	// free_app_config only touches the fields of app_config when it is
+	// not NULL, that is when a configuration was loaded.
+	free_app_config(app_config);
 	free(app_config_buf);
 
 	return ret;
 }
 
+// append_arg: Appends str to the quoted argument in buf, which holds
+// QUOTED_ARG_MAX bytes.
+//
+// Return value:
+// 0 on success, -1 when the argument does not fit (buf stays intact).
+static int append_arg(char *buf, const char *str) {
+	size_t used = strlen(buf);
+	size_t len = strlen(str);
+
+	if (used + len >= QUOTED_ARG_MAX) {
+		fprintf(stderr, "Quoted argument is longer than %d bytes\n", QUOTED_ARG_MAX - 1);
+		return -1;
+	}
+	memcpy(buf + used, str, len + 1);
+	return 0;
+}
+
 int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	int i = 0;
 	pid_t pid;
-	char *new_argv[128];
 	// The arguments of the app are the same as the ones for urunit, but
-	// removing the urunit argv[0]. Therefore:
+	// removing the urunit argv[0]. Therefore at most argc - 1 of them and
+	// the NULL at the end.
+	char **new_argv = NULL;
 	int new_argc = 0;
+
+	new_argv = calloc((size_t)(argc > 0 ? argc : 1), sizeof(char *));
+	if (!new_argv) {
+		fprintf(stderr, "Failed to allocate memory for the application arguments\n");
+		return 1;
+	}
 
 	for (i = 1; i < argc; i++) {
 		char *tmp_arg = argv[i];
+		char quote = tmp_arg[0];
 
-		if (tmp_arg[0] == '\'') {
+		if (quote == '\'' || quote == '"') {
 			// The below is safe since the tmp_arg has at least one char
 			uint32_t last_char = strlen(tmp_arg) - 1;
-			if (tmp_arg[last_char] == '\'') {
+			if (tmp_arg[last_char] == quote) {
 				new_argv[new_argc++] = argv[i];
 				continue;
 			}
-			// This arg (and everything until we encounter a ')
-			// is part of the same argument
+			// This arg (and everything until we encounter the same
+			// quote) is part of the same argument
 			int j = 0;
-			char buffer[1024] = {0};
+			char buffer[QUOTED_ARG_MAX] = {0};
 
-			strcat(buffer, tmp_arg + 1); // skip '
+			if (append_arg(buffer, tmp_arg + 1) != 0) { // skip the quote
+				free(new_argv);
+				return 1;
+			}
 			for (j = i + 1; j < argc; j++) {
 				char *next_arg = argv[j];
 				size_t arg_len = strlen(next_arg);
@@ -1206,63 +1238,23 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 				}
 				last_char = arg_len - 1;
 				if (last_char == 0) {
-					if (next_arg[last_char] == '\'') {
+					if (next_arg[last_char] == quote) {
 						should_break = 1;
-						// Remove '
+						// Remove the quote
 						next_arg[last_char] = '\0';
 					}
 				} else {
-					if (next_arg[last_char] == '\'' && next_arg[last_char - 1] != '\'' ) {
+					if (next_arg[last_char] == quote && next_arg[last_char - 1] != quote) {
 						should_break = 1;
-						// Remove '
+						// Remove the quote
 						next_arg[last_char] = '\0';
 					}
 				}
-				strcat(buffer, " ");
-				strcat(buffer, next_arg);
-				if (should_break) {
-					break;
+				if (append_arg(buffer, " ") != 0 ||
+				    append_arg(buffer, next_arg) != 0) {
+					free(new_argv);
+					return 1;
 				}
-			}
-			new_argv[new_argc++] = strdup(buffer);
-			break;
-		} else if (tmp_arg[0] == '"') {
-			// The below is safe since the tmp_arg has at least one char
-			uint32_t last_char = strlen(tmp_arg) - 1;
-			if (tmp_arg[last_char] == '"') {
-				new_argv[new_argc++] = argv[i];
-				continue;
-			}
-			// This arg (and everything until we encounter a ")
-			// is part of the same argument
-			int j = 0;
-			char buffer[1024] = {0};
-
-			strcat(buffer, tmp_arg + 1); // skip "
-			for (j = i + 1; j < argc; j++) {
-				char *next_arg = argv[j];
-				size_t arg_len = strlen(next_arg);
-				uint32_t last_char = 0;
-				uint8_t should_break = 0;
-				if (arg_len == 0) {
-					continue;
-				}
-				last_char = arg_len - 1;
-				if (last_char == 0) {
-					if (next_arg[last_char] == '"') {
-						should_break = 1;
-						// Remove '
-						next_arg[last_char] = '\0';
-					}
-				} else {
-					if (next_arg[last_char] == '"' && next_arg[last_char - 1] != '"' ) {
-						should_break = 1;
-						// Remove '
-						next_arg[last_char] = '\0';
-					}
-				}
-				strcat(buffer, " ");
-				strcat(buffer, next_arg);
 				if (should_break) {
 					break;
 				}
@@ -1278,14 +1270,71 @@ int spawn_app(int argc, char *argv[], pid_t *child_pid) {
 	pid = fork();
 	if (pid < 0) {
 		perror("fork");
+		free(new_argv);
 		return 1;
 	} else if (pid == 0) {
-		return child_func(argc, new_argv);
+		// The child only returns from child_func when it could not
+		// execute the app. Exit here, so that it never returns into the
+		// caller of supervise_main as if it were the supervisor.
+		exit(child_func(argc, new_argv));
 	}
 
 	*child_pid = pid;
+	free(new_argv);
 
 	return 0;
+}
+
+// spawn_agent: Forks the exec agent as a child of urunit. The agent is part
+// of the same binary, so the child calls agent_main(), where urunit used to
+// execute a separate agent from /run/urunc/urunit-agent. The agent
+// inherits urunit's environment and standard streams (the console) and runs in
+// its own process group, so that terminal signals meant for the application
+// do not reach it. It is reaped by the reaping loop like every other child;
+// its exit does not end the guest, and it is asked to exit (SIGTERM) once the
+// application has exited.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// The pid of the agent, or -1 when fork() failed.
+pid_t spawn_agent(void) {
+	pid_t pid;
+
+	pid = fork();
+	if (pid == 0) {
+		if (setpgid(0, 0) < 0) {
+			perror("setpgid agent");
+		}
+#ifdef __linux__
+		agentlog_init();
+		_exit(agent_main());
+#else
+		_exit(1);
+#endif
+	}
+	return pid;
+}
+
+// stop_agent: Asks the agent urunit started, if it is still running, to exit
+// with SIGTERM. Called once the application has exited, so that the agent can
+// end its sessions before the shutdown. reap() does not wait for it, and the
+// reboot at the end of the shutdown ends it.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// No return value.
+void stop_agent(void) {
+	if (agent_pid <= 0) {
+		return;
+	}
+	DEBUG_PRINTF("Asking agent %d to exit\n", agent_pid);
+	if (kill(agent_pid, SIGTERM) < 0 && errno != ESRCH) {
+		perror("kill agent");
+	}
 }
 
 int reap(const pid_t child_pid, int *child_exitcode_ptr) {
@@ -1328,21 +1377,34 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 				// Be safe, ensure the status code is indeed between 0 and 255.
 				*child_exitcode_ptr = *child_exitcode_ptr % (STATUS_MAX - STATUS_MIN + 1);
 
+				// The app is done. The agent urunit started would
+				// otherwise run forever, so ask it to exit. Nothing
+				// else is signalled: any other process still around
+				// is the app's responsibility.
+				stop_agent();
+
 				/* The app is what we are here to supervise, so stop
 				 * waiting now that it is gone. Continuing would block
 				 * in waitpid() on whatever else is still running --
 				 * a sidecar started before us and inherited when we
 				 * became PID 1, for instance -- and that process has
-				 * no reason to ever exit. main() would then never get
-				 * to see the exit code, and the shutdown below it
-				 * (sync, unmount, reboot) would never run: the guest
-				 * stays up forever with nothing left to do.
+				 * no reason to ever exit. supervise_main() would then
+				 * never get to see the exit code, and the shutdown
+				 * after it (sync, unmount, reboot) would never run:
+				 * the guest stays up forever with nothing left to do.
 				 *
-				 * Anything still alive is dealt with by the shutdown
-				 * itself, which syncs and unmounts before asking the
-				 * platform to power the machine off.
+				 * This includes the agent: it was only sent SIGTERM
+				 * and it is not waited for. The reboot (or power off)
+				 * at the end of the shutdown ends it, like anything
+				 * else still alive, after the shutdown has synced and
+				 * unmounted.
 				 */
 				return 0;
+			} else if (reaped_pid == agent_pid) {
+				// Forget the agent, so that its pid is not signalled
+				// later, when it may have been reused.
+				DEBUG_PRINT("The agent exited\n");
+				agent_pid = 0;
 			}
 			continue;
 		}
@@ -1353,7 +1415,24 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 	return 0;
 }
 
-int main(int argc, char *argv[]) {
+// should_spawn_agent: Decides whether this boot runs the exec agent. The
+// early init of a generic container boot stages a copy of the binary at
+// URUNIT_STAGED_BIN in the new root, where it used to stage the separate
+// agent binary. Any other boot (e.g. urunit as
+// the init of a unikernel rootfs) runs no agent.
+//
+// Return value:
+// 1 if the agent should be started, otherwise 0.
+static int should_spawn_agent(void) {
+#ifdef __linux__
+	return access(URUNIT_STAGED_BIN, X_OK) == 0;
+#else
+	// The agent and the early init are Linux only.
+	return 0;
+#endif
+}
+
+int supervise_main(int argc, char *argv[]) {
 	pid_t app_pid;
 	int ret = 0;
 	int app_exitcode = -1;
@@ -1390,6 +1469,18 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	// The agent is started before the app, as urunit's own child, so that
+	// urunit reaps it too. A failure to start it is reported and does not
+	// prevent the application from starting.
+	if (should_spawn_agent()) {
+		DEBUG_PRINT("Spawn the agent\n");
+		agent_pid = spawn_agent();
+		if (agent_pid < 0) {
+			perror("fork agent");
+			agent_pid = 0;
+		}
+	}
+
 	DEBUG_PRINT("Spawn the app\n");
 	ret = spawn_app(argc, argv, &app_pid);
 	if (ret) {
@@ -1414,4 +1505,8 @@ int main(int argc, char *argv[]) {
 	sync();
 	unmount_external();
 	request_reboot();
+
+	// The reboot did not happen.
+	perror("reboot");
+	return 1;
 }

@@ -23,6 +23,7 @@
 #include <linux/reboot.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -76,6 +77,37 @@ int read_block_dev_serial(const char *device_name, char *serial, const size_t si
 	return 0;
 }
 
+// vblock_device_name: Writes the path of the nth (zero-based) virtio block
+// device (vd*) to device_path, which must hold at least VBLOCK_NAME_SZ bytes.
+// n == 0 maps to /dev/vda, n == 1 to /dev/vdb, and so on.
+//
+// Arguments:
+// 1. n:		Zero-based index of the virtio block device.
+// 2. device_path:	The buffer that will store the path to the block device.
+void vblock_device_name(const uint32_t n, char *device_path) {
+	// TODO: Add support for more than 26 devices.
+	char device_name[] = "/dev/vda";
+
+	device_name[7] = 'a' + (n % 26);
+	// It is safe here to do a quick memcpy, since device_name has
+	// a specific size and only its last character (of the string,
+	// not NULL termination byte) can change
+	memcpy(device_path, device_name, sizeof(device_name));
+}
+
+// is_order_block_id: Checks whether a block ID from the configuration names
+// the device by its order rather than by its serial ID. urunc prefixes the
+// IDs with "FC" for Firecracker, which does not expose serial IDs.
+//
+// Arguments:
+// 1. id:	The block ID from the configuration.
+//
+// Return value:
+// 1 if the device is found by its order, otherwise 0.
+int is_order_block_id(const char *id) {
+	return strlen(id) > 2 && id[0] == 'F' && id[1] == 'C';
+}
+
 // find_vblock_device_by_order: Returns the nth (zero-based) virtio block device
 // (vd*) if it exists. The order is based on the conventional naming of virtio
 // block devices in Linux where usually the first attached is vda, second vdb,
@@ -88,21 +120,14 @@ int read_block_dev_serial(const char *device_name, char *serial, const size_t si
 // Return value:
 // On success 0 is returned and device_path parameter will hold the path
 // the the device with the specific ID.
-// Otherwise -1 is returned.
+// Otherwise -1 is returned and device_path stays intact.
 int find_vblock_device_by_order(const uint32_t n, char *device_path) {
-	// TODO: Add support for more than 26 devices.
-	char suffix = 'a' + (n % 26);
-	char device_name[] = "/dev/vda";
-	int ret = 0;
+	char device_name[VBLOCK_NAME_SZ];
 
-	device_name[7] = suffix;
-	ret = access(device_name, F_OK);
-	if (ret)
+	vblock_device_name(n, device_name);
+	if (access(device_name, F_OK))
 		return -1;
 
-	// It is safe here to doa quick memcpy, since device_name has
-	// a specific size and only its last character (of the string,
-	// not NULL temrination byte) can change
 	memcpy(device_path, device_name, sizeof(device_name));
 	return 0;
 }
@@ -148,8 +173,29 @@ int find_vblock_device_by_serial(const char *target_serial, char *device_path) {
 	return -1;
 }
 
+// tmp_is_mounted: Tells whether /tmp is a mount point, i.e. lives on another
+// device than its parent.
+static int tmp_is_mounted(void) {
+	struct stat tmp, root;
+
+	if (stat("/tmp", &tmp) < 0 || stat("/", &root) < 0) {
+		return 0;
+	}
+	return tmp.st_dev != root.st_dev;
+}
+
 // mount_special_fs: Mounts the special filesystems procfs and sysfs in /proc and
-// /sys respectively, plus a tmpfs on /tmp.
+// /sys respectively.
+//
+// In a generic container boot the early init has already mounted both in the
+// new root before it hands over to the supervisor. Mounting the same procfs or
+// sysfs again on top of itself fails with EBUSY, which therefore means that the
+// filesystem is already there.
+//
+// It also mounts a tmpfs on /tmp, unless /tmp is a mount point already. The
+// early init of a container boot mounts one when it stages urunit.conf, and
+// mounting another on top would hide the staged files. Any other boot has no
+// early init, so this is where applications get a writable /tmp.
 //
 // Arguments:
 // No arguments.
@@ -164,7 +210,7 @@ int mount_special_fs(void) {
 		return 1;
 	}
 	ret = mount("proc", "/proc", "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
-	if (ret < 0) {
+	if (ret < 0 && errno != EBUSY) {
 		perror("mount /proc");
 		return 1;
 	}
@@ -174,15 +220,14 @@ int mount_special_fs(void) {
 		return 1;
 	}
 	ret = mount("sysfs", "/sys", "sysfs", 0, NULL);
-	if (ret < 0) {
+	if (ret < 0 && errno != EBUSY) {
 		perror("mount /sys");
 		return 1;
 	}
 
 	// A writable /tmp is expected by most applications. Unlike /proc and
 	// /sys, urunit does not itself depend on it, so a failure is not fatal.
-	ret = ensure_dir("/tmp");
-	if (ret == 0) {
+	if (!tmp_is_mounted() && ensure_dir("/tmp") == 0) {
 		ret = mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID|MS_NODEV, "mode=1777");
 		if (ret < 0) {
 			perror("mount /tmp");
@@ -220,7 +265,7 @@ int mount_block_vols(struct block_config **vols) {
 		blk_count++;
 		first_new_dir[0] = '\0';
 		DEBUG_PRINTF("Searching block device with serial ID %s\n", tmp_bc->id);
-		if (strlen(tmp_bc->id) > 2 && tmp_bc->id[0] == 'F' && tmp_bc->id[1] == 'C') {
+		if (is_order_block_id(tmp_bc->id)) {
 			ret = find_vblock_device_by_order(blk_count, block_dev);
 		} else {
 			ret = find_vblock_device_by_serial(tmp_bc->id, block_dev);
@@ -304,7 +349,7 @@ int set_default_route(void) {
 	return ret;
 }
 
-// unmount_external: Unmounts all the external filesstem mounts found in
+// unmount_external: Unmounts all the external filesystem mounts found in
 // /proc/self/mountinfo. External means all the known block, network and cloud storage
 // based filesystems.
 //
@@ -378,80 +423,6 @@ void unmount_external(void) {
 
 int set_subreaper(void) {
 	return prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-}
-
-// setup_console: On Linux the kernel opens the console for init.
-int setup_console(void) {
-	return 0;
-}
-
-// remount_root_rw: On Linux the root filesystem is already writable by the time
-// urunit runs (urunc/the kernel set it up), so there is nothing to do here.
-int remount_root_rw(void) {
-	return 0;
-}
-
-// get_boot_var: On Linux, name=value boot parameters reach init as
-// environment variables, so there is nothing else to look at.
-char *get_boot_var(const char *name) {
-	(void)name; // just to suppress the unused warning
-	return NULL;
-}
-
-// read_raw_device: Reads the whole contents of a block device. The caller is
-// responsible to free the returned buffer.
-char *read_raw_device(int fd, size_t *size) {
-	uint64_t dev_size = 0;
-	char *buffer = NULL;
-	size_t off = 0;
-	int ret = 0;
-	// BLKGETSIZE64 does not fit in an int. glibc's ioctl takes an unsigned
-	// long request, but musl's takes an int, so passing the constant
-	// directly overflows under -Werror there. Hold it in an unsigned long
-	// so the (musl) narrowing is a runtime conversion, not a constant one.
-	unsigned long request = BLKGETSIZE64;
-
-	ret = ioctl(fd, request, &dev_size);
-	if (ret < 0) {
-		perror("BLKGETSIZE64");
-		return NULL;
-	}
-	if (dev_size == 0 || dev_size > (1024 * 1024)) {
-		fprintf(stderr, "Unexpected configuration device size %llu\n",
-			(unsigned long long)dev_size);
-		return NULL;
-	}
-	buffer = malloc(dev_size + 1);
-	if (!buffer) {
-		fprintf(stderr, "Failed to allocate memory for the configuration device\n");
-		return NULL;
-	}
-	while (off < dev_size) {
-		ssize_t n = 0;
-
-		n = pread(fd, buffer + off, dev_size - off, (off_t)off);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("read configuration device");
-			free(buffer);
-			return NULL;
-		}
-		if (n == 0)
-			break;
-		off += (size_t)n;
-	}
-	buffer[off] = '\0';
-	*size = off;
-
-	return buffer;
-}
-
-// configure_network: On Linux the network is configured by the kernel
-// through the ip= boot parameter.
-int configure_network(struct net_config *net) {
-	(void)net;
-	return 0;
 }
 
 // The ioctl to get the device number of the terminal behind an alias
@@ -539,6 +510,80 @@ int setup_controlling_tty(void) {
 		close(fd);
 	}
 
+	return 0;
+}
+
+// read_raw_device: Reads the whole contents of a block device. The caller is
+// responsible to free the returned buffer.
+char *read_raw_device(int fd, size_t *size) {
+	uint64_t dev_size = 0;
+	char *buffer = NULL;
+	size_t off = 0;
+	int ret = 0;
+	// BLKGETSIZE64 does not fit in an int. glibc's ioctl takes an unsigned
+	// long request, but musl's takes an int, so passing the constant
+	// directly overflows under -Werror there. Hold it in an unsigned long
+	// so the (musl) narrowing is a runtime conversion, not a constant one.
+	unsigned long request = BLKGETSIZE64;
+
+	ret = ioctl(fd, request, &dev_size);
+	if (ret < 0) {
+		perror("BLKGETSIZE64");
+		return NULL;
+	}
+	if (dev_size == 0 || dev_size > (1024 * 1024)) {
+		fprintf(stderr, "Unexpected configuration device size %llu\n",
+			(unsigned long long)dev_size);
+		return NULL;
+	}
+	buffer = malloc(dev_size + 1);
+	if (!buffer) {
+		fprintf(stderr, "Failed to allocate memory for the configuration device\n");
+		return NULL;
+	}
+	while (off < dev_size) {
+		ssize_t n = 0;
+
+		n = pread(fd, buffer + off, dev_size - off, (off_t)off);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("read configuration device");
+			free(buffer);
+			return NULL;
+		}
+		if (n == 0)
+			break;
+		off += (size_t)n;
+	}
+	buffer[off] = '\0';
+	*size = off;
+
+	return buffer;
+}
+
+// setup_console: On Linux the kernel opens the console for init.
+int setup_console(void) {
+	return 0;
+}
+
+// remount_root_rw: On Linux the root filesystem is already writable by the time
+// urunit runs (urunc/the kernel set it up), so there is nothing to do here.
+int remount_root_rw(void) {
+	return 0;
+}
+
+// get_boot_var: On Linux, name=value boot parameters reach init as
+// environment variables, so there is nothing else to look at.
+char *get_boot_var(const char *name) {
+	(void)name; // just to suppress the unused warning
+	return NULL;
+}
+
+// configure_network: On Linux the network is configured by the kernel
+// through the ip= boot parameter.
+int configure_network(struct net_config *net) {
+	(void)net;
 	return 0;
 }
 

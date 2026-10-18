@@ -31,18 +31,27 @@ URUNIT_BIN_STATIC_DEBUG  := $(BUILD_DIR)/urunit_static_debug
 CC     ?= gcc
 CFLAGS := -Werror -Wextra -Wall -pedantic-errors -Wformat
 CFLAGS += -std=gnu99 -O2 -fstack-protector --param=ssp-buffer-size=4
+CFLAGS += -ffunction-sections -fdata-sections
 
 # Linking FLAGS
-LDFLAGS        := -Wl,-Bsymbolic-functions -Wl,-z,relro -Wl,-s
+LDFLAGS        := -Wl,-Bsymbolic-functions -Wl,-z,relro -Wl,-s -Wl,--gc-sections
 STATIC_LDFLAGS := -Wl,--no-export-dynamic -static
 
 # Source files variables
 SOURCE_DIR := src
 
-URUNIT_SRC := ${SOURCE_DIR}/main.c ${SOURCE_DIR}/common.c
+# urunit.c holds main(), which picks the role from argv[0]; the supervisor is
+# in main.c.
+URUNIT_SRC := ${SOURCE_DIR}/urunit.c ${SOURCE_DIR}/main.c ${SOURCE_DIR}/mode.c \
+              ${SOURCE_DIR}/common.c
 
 # Header files
-URUNIT_HDR := ${SOURCE_DIR}/common.h
+URUNIT_HDR := $(wildcard ${SOURCE_DIR}/*.h)
+
+# Unit tests: every source except urunit.c, plus src/tests. Linux only.
+TEST_SRC        := $(wildcard ${SOURCE_DIR}/tests/*.c)
+TEST_HDR        := $(wildcard ${SOURCE_DIR}/tests/*.h)
+URUNIT_BIN_TEST := $(BUILD_DIR)/urunit_tests
 
 # Install dependencies variables
 #
@@ -74,8 +83,12 @@ ifndef TARGET_OS
     endif
 endif
 
+# The early init (init.c, sysops.c), the exec agent (agent.c, agentlog.c) and
+# its protocol (proto.c) only run on Linux guests.
 ifeq ($(TARGET_OS),Linux)
-    URUNIT_SRC += ${SOURCE_DIR}/linux.c
+    URUNIT_SRC += ${SOURCE_DIR}/linux.c ${SOURCE_DIR}/init.c \
+                  ${SOURCE_DIR}/sysops.c ${SOURCE_DIR}/proto.c \
+                  ${SOURCE_DIR}/agent.c ${SOURCE_DIR}/agentlog.c
 endif
 ifeq ($(TARGET_OS),FreeBSD)
     URUNIT_SRC += ${SOURCE_DIR}/freebsd.c
@@ -113,8 +126,19 @@ dynamic: $(URUNIT_BIN_DYNAMIC)
 .PHONY: dynamic_debug
 dynamic_debug: $(URUNIT_BIN_DYNAMIC_DEBUG)
 
+## check Build and run the unit tests (Linux only).
+.PHONY: check
+check: $(URUNIT_BIN_TEST)
+	$(URUNIT_BIN_TEST)
+
 $(BUILD_DIR):
 	mkdir -p $@
+
+$(URUNIT_BIN_TEST): $(URUNIT_SRC) $(URUNIT_HDR) $(TEST_SRC) $(TEST_HDR) | prepare
+ifneq ($(TARGET_OS),Linux)
+	$(error the unit tests run on Linux only)
+endif
+	$(CC) $(CFLAGS) -I${SOURCE_DIR} $(filter-out ${SOURCE_DIR}/urunit.c,$(URUNIT_SRC)) $(TEST_SRC) -o $@
 
 $(URUNIT_BIN_DYNAMIC): $(URUNIT_SRC) $(URUNIT_HDR) | prepare
 	$(CC) $(CFLAGS) $(URUNIT_SRC) $(LDFLAGS) -o $@
