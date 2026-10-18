@@ -38,6 +38,10 @@ struct sysops {
 	int (*setenv)(const char *key, const char *val);
 	// Returns 0 when path exists and is executable.
 	int (*access_x)(const char *path);
+	// Returns 0 when path exists.
+	int (*exists)(const char *path);
+	// Sleeps for ms milliseconds.
+	void (*nap)(unsigned int ms);
 	// Returns the contents of path in a heap buffer with a terminating NUL
 	// that len does not count, or NULL when the file cannot be read.
 	char *(*read_file)(const char *path, size_t *len);
@@ -114,6 +118,30 @@ char *init_resolve_command(const struct sysops *ops, const char *newroot,
 // lines that start with '#' are skipped. Returns 0, or -1 when a setenv
 // failed.
 int init_env_export(const struct sysops *ops, const char *buf);
+
+// The upper layer of the overlay that /urunc-rootfs-upper names.
+enum init_upper_kind {
+	INIT_UPPER_TMPFS,
+	INIT_UPPER_VIRTIOFS,
+	INIT_UPPER_BLOCK,
+};
+
+// Parses /urunc-rootfs-lower, block:<serial>:<fstype>, into heap copies of
+// the serial and the filesystem type. Returns -1, and sets neither, for
+// anything else.
+int init_parse_lower(const char *line, char **serial, char **fstype);
+
+// Parses /urunc-rootfs-upper: block:<serial>, the older words block
+// (/dev/vda) and virtiofs (the tag rootfs-upper), or nothing for a tmpfs.
+// *serial is a heap copy for block:<serial> and NULL otherwise. Returns -1
+// for any other word.
+int init_parse_upper(const char *line, enum init_upper_kind *kind,
+		     char **serial);
+
+// Returns "/dev/<name>" for the virtio-blk disk whose serial is serial, in a
+// heap buffer, or NULL when none answers after tries looks 100 ms apart.
+char *init_dev_by_serial(const struct sysops *ops, const char *serial,
+			 int tries);
 
 // Splits mount options into MS_* flags, added to *flags, and the options
 // left for the filesystem. Returns those as a heap string, or NULL when

@@ -173,6 +173,19 @@ static int sysops_setenv(const char *key, const char *val)
 	return setenv(key, val, 1);
 }
 
+static int sysops_exists(const char *path)
+{
+	return access(path, F_OK);
+}
+
+static void sysops_nap(unsigned int ms)
+{
+	struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+
+	while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+		;
+}
+
 static int sysops_access_x(const char *path)
 {
 	struct stat st;
@@ -344,6 +357,8 @@ const struct sysops sysops_real = {
 	.set_clock = sysops_set_clock,
 	.setenv = sysops_setenv,
 	.access_x = sysops_access_x,
+	.exists = sysops_exists,
+	.nap = sysops_nap,
 	.read_file = sysops_read_file,
 	.switch_root = sysops_switch_root_real,
 	.log = sysops_log,

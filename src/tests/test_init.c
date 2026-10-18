@@ -258,6 +258,16 @@ static void fake_log(const char *fmt, ...)
 	va_end(ap);
 }
 
+static int fake_exists(const char *path)
+{
+	return fake_lookup(path) != NULL ? 0 : -1;
+}
+
+static void fake_nap(unsigned int ms)
+{
+	fake_record("nap %u", ms);
+}
+
 static const struct sysops fake_ops = {
 	.mount = fake_mount,
 	.umount = fake_umount,
@@ -269,6 +279,8 @@ static const struct sysops fake_ops = {
 	.set_clock = fake_set_clock,
 	.setenv = fake_setenv,
 	.access_x = fake_access_x,
+	.exists = fake_exists,
+	.nap = fake_nap,
 	.read_file = fake_read_file,
 	.switch_root = fake_switch_root,
 	.log = fake_log,
@@ -855,6 +867,233 @@ static void test_default_hosts(void)
 	free_argv(out);
 }
 
+// The markers hull stages for an overlay-block root.
+static void test_overlay_markers(void)
+{
+	static const struct {
+		const char *line;
+		const char *serial;
+		const char *fstype;
+	} lower[] = {
+		{ "block:disk0:ext4", "disk0", "ext4" },
+		{ "block:disk0:ext4\n", "disk0", "ext4" },
+		{ "block:a.b_c-1:erofs", "a.b_c-1", "erofs" },
+		{ "block:disk0:", NULL, NULL },
+		{ "block::ext4", NULL, NULL },
+		{ "block:disk0", NULL, NULL },
+		{ "virtiofs", NULL, NULL },
+		{ "block:disk 0:ext4", NULL, NULL },
+		{ "block:disk0:Ext4", NULL, NULL },
+		{ "block:disk0:ext4:x", NULL, NULL },
+		{ "block:abcdefghijklmnopqrstu:ext4", NULL, NULL },
+	};
+	static const struct {
+		const char *line;
+		int rc;
+		enum init_upper_kind kind;
+		const char *serial;
+	} upper[] = {
+		{ "", 0, INIT_UPPER_TMPFS, NULL },
+		{ "\n", 0, INIT_UPPER_TMPFS, NULL },
+		{ "virtiofs\n", 0, INIT_UPPER_VIRTIOFS, NULL },
+		{ "block", 0, INIT_UPPER_BLOCK, NULL },
+		{ "block:disk1\n", 0, INIT_UPPER_BLOCK, "disk1" },
+		{ "block:", -1, INIT_UPPER_TMPFS, NULL },
+		{ "block:disk/1", -1, INIT_UPPER_TMPFS, NULL },
+		{ "tmpfs", -1, INIT_UPPER_TMPFS, NULL },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(lower) / sizeof(lower[0]); i++) {
+		char *serial = NULL;
+		char *fstype = NULL;
+		int rc = init_parse_lower(lower[i].line, &serial, &fstype);
+
+		if (lower[i].serial == NULL) {
+			if (rc != -1)
+				HARNESS_FAIL("lower '%s' parsed", lower[i].line);
+			continue;
+		}
+		CHECK_EQ_INT(rc, 0);
+		if (rc == 0) {
+			CHECK_EQ_STR(serial, lower[i].serial);
+			CHECK_EQ_STR(fstype, lower[i].fstype);
+		}
+		free(serial);
+		free(fstype);
+	}
+	for (i = 0; i < sizeof(upper) / sizeof(upper[0]); i++) {
+		enum init_upper_kind kind = INIT_UPPER_TMPFS;
+		char *serial = NULL;
+		int rc = init_parse_upper(upper[i].line, &kind, &serial);
+
+		if (rc != upper[i].rc) {
+			HARNESS_FAIL("upper '%s': rc %d, want %d", upper[i].line,
+				     rc, upper[i].rc);
+		} else if (rc == 0) {
+			CHECK_EQ_INT(kind, upper[i].kind);
+			if (upper[i].serial == NULL)
+				CHECK(serial == NULL);
+			else if (serial != NULL)
+				CHECK_EQ_STR(serial, upper[i].serial);
+			else
+				HARNESS_FAIL("upper '%s': no serial",
+					     upper[i].line);
+		}
+		free(serial);
+	}
+}
+
+// Disks are found by serial, not by probe order, and only when the device
+// node exists. A missing one is looked for again, 100 ms apart.
+static void test_dev_by_serial(void)
+{
+	char *dev;
+
+	fake_reset();
+	fake_add("/sys/block/vda/serial", "disk1", 0);
+	fake_add("/sys/block/vdb/serial", "disk0", 0);
+	fake_add("/sys/block/vdc/serial", "disk2", 0);
+	fake_add("/dev/vda", "", 0);
+	fake_add("/dev/vdb", "", 0);
+	dev = init_dev_by_serial(&fake_ops, "disk0", 3);
+	CHECK(dev != NULL);
+	if (dev != NULL)
+		CHECK_EQ_STR(dev, "/dev/vdb");
+	free(dev);
+	CHECK(init_dev_by_serial(&fake_ops, "disk2", 3) == NULL);
+	CHECK_EQ_STR(fake_calls, "nap 100\nnap 100\n");
+	CHECK(init_dev_by_serial(&fake_ops, "disk", 1) == NULL);
+}
+
+// Scenario: hull's overlay-block root on Vz or hvi. The lower is a
+// read-only ext4 disk, the upper a writable one, both found by serial.
+static void test_vz_overlay_block(void)
+{
+	char *argv[] = { "/vz-init", "/bin/true", NULL };
+	char **out = NULL;
+	int out_argc = 0;
+	int rc;
+
+	fake_reset();
+	fake_add("/urunc-rootfs-lower", "block:disk0:ext4\n", 0);
+	fake_add("/urunc-rootfs-upper", "block:disk1\n", 0);
+	fake_add("/sys/block/vda/serial", "disk0", 0);
+	fake_add("/sys/block/vdb/serial", "disk1", 0);
+	fake_add("/dev/vda", "", 0);
+	fake_add("/dev/vdb", "", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_VZ_INIT, 2, argv, NULL,
+		      &out_argc, &out);
+	CHECK_EQ_INT(rc, 0);
+	CHECK_CALLS(EARLY_MOUNTS,
+		    "mkdir_p /lowerroot 755",
+		    "mount /dev/vda /lowerroot ext4 ro -",
+		    "mkdir_p /newroot 755",
+		    "mkdir_p /run/urunc-overlay 755",
+		    "mount /dev/vdb /run/urunc-overlay ext4 0 -",
+		    "mkdir_p /run/urunc-overlay/upper 755",
+		    "mkdir_p /run/urunc-overlay/work 755",
+		    "mount overlay /newroot overlay 0 lowerdir=/lowerroot,"
+		    "upperdir=/run/urunc-overlay/upper,"
+		    "workdir=/run/urunc-overlay/work",
+		    "mkdir_p /newroot/tmp 755",
+		    "chmod /newroot/tmp 1777",
+		    "mkdir_p /newroot/etc 755",
+		    CHMOD_NET,
+		    DEFAULT_HOSTS,
+		    STAGE_BIN,
+		    MOVE_MOUNTS,
+		    "switch_root /newroot");
+	free_argv(out);
+
+	// The older upper words, with the lower still on virtiofs.
+	fake_reset();
+	fake_add("/urunc-rootfs-upper", "virtiofs\n", 0);
+	CHECK_EQ_INT(init_run(&fake_ops, URUNIT_MODE_VZ_INIT, 2, argv, NULL,
+			      &out_argc, &out), 0);
+	CHECK(strstr(fake_calls, "mount rootfs /lowerroot virtiofs 0 -\n") !=
+	      NULL);
+	CHECK(strstr(fake_calls, "mount rootfs-upper /run/urunc-overlay "
+				 "virtiofs 0 -\n") != NULL);
+	free_argv(out);
+
+	fake_reset();
+	fake_add("/urunc-rootfs-upper", "block", 0);
+	CHECK_EQ_INT(init_run(&fake_ops, URUNIT_MODE_VZ_INIT, 2, argv, NULL,
+			      &out_argc, &out), 0);
+	CHECK(strstr(fake_calls, "mount /dev/vda /run/urunc-overlay ext4 0 -\n")
+	      != NULL);
+	free_argv(out);
+}
+
+// Every failure of a block lower or a persistent upper ends the boot, with
+// no fallback to a direct virtiofs root.
+static void test_vz_overlay_block_fails(void)
+{
+	static const struct {
+		const char *lower;
+		const char *upper;
+		int direct;
+		const char *fail;
+		const char *msg;
+	} cases[] = {
+		{ "block:disk9:ext4", NULL, 0, NULL,
+		  "no virtio-blk disk with serial disk9 for the lower layer" },
+		{ "block:disk0:ext4", NULL, 1, NULL,
+		  "/urunc-rootfs-direct and /urunc-rootfs-lower are both present" },
+		{ "bogus", NULL, 0, NULL,
+		  "cannot parse /urunc-rootfs-lower: 'bogus'" },
+		{ NULL, "tmpfs", 0, NULL,
+		  "cannot parse /urunc-rootfs-upper: 'tmpfs'" },
+		{ "block:disk0:ext4", "block:disk0", 0, NULL,
+		  "the upper layer /dev/vda is also the lower layer" },
+		{ "block:disk0:ext4", "block:disk8", 0, NULL,
+		  "no virtio-blk disk with serial disk8 for the upper layer" },
+		{ "block:disk0:ext4", NULL, 0, "mount /dev/vda /lowerroot",
+		  "could not mount ext4 root /dev/vda" },
+		{ "block:disk0:ext4", "block:disk1", 0,
+		  "mount /dev/vdb /run/urunc-overlay",
+		  "could not mount the block upper layer" },
+		{ "block:disk0:ext4", NULL, 0, "mount overlay ",
+		  "could not mount the overlay over /dev/vda" },
+		{ NULL, "virtiofs", 0, "mount overlay ",
+		  "could not mount the overlay over rootfs" },
+	};
+	char *argv[] = { "/vz-init", "/bin/true", NULL };
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		char **out = NULL;
+		int out_argc = 0;
+		int rc;
+
+		fake_reset();
+		if (cases[i].lower != NULL)
+			fake_add("/urunc-rootfs-lower", cases[i].lower, 0);
+		if (cases[i].upper != NULL)
+			fake_add("/urunc-rootfs-upper", cases[i].upper, 0);
+		if (cases[i].direct)
+			fake_add("/urunc-rootfs-direct", "", 0);
+		fake_add("/sys/block/vda/serial", "disk0", 0);
+		fake_add("/sys/block/vdb/serial", "disk1", 0);
+		fake_add("/dev/vda", "", 0);
+		fake_add("/dev/vdb", "", 0);
+		fake_fail[0] = cases[i].fail;
+		rc = init_run(&fake_ops, URUNIT_MODE_VZ_INIT, 2, argv, NULL,
+			      &out_argc, &out);
+		if (rc == 0)
+			HARNESS_FAIL("case %zu booted", i);
+		if (strstr(fake_console, cases[i].msg) == NULL)
+			HARNESS_FAIL("case %zu: want '%s' on the console, got '%s'",
+				     i, cases[i].msg, fake_console);
+		if (strstr(fake_calls, "mount rootfs /newroot") != NULL)
+			HARNESS_FAIL("case %zu fell back to a direct root", i);
+		if (strstr(fake_calls, "switch_root") != NULL)
+			HARNESS_FAIL("case %zu switched root", i);
+		free_argv(out);
+	}
+}
+
 static void test_init_parsers(void)
 {
 	const char *tsv = "a\t/x\tro\nb\t/y\n\tc\n\nd\t/z\trw";
@@ -900,6 +1139,10 @@ int run_init_tests(void)
 	test_init_missing_fstype();
 	test_vz_direct();
 	test_default_hosts();
+	test_overlay_markers();
+	test_dev_by_serial();
+	test_vz_overlay_block();
+	test_vz_overlay_block_fails();
 	test_vz_full();
 	test_vz_overlay_fallback();
 	test_vz_rootfs_fails();

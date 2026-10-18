@@ -40,9 +40,15 @@
 //   /proc /sys /dev    mount                     mount
 //   /urunc-epoch       set the clock             set the clock
 //   /urunc-rosetta     register Rosetta          register Rosetta
-//   root               root= of the cmdline      virtiofs tag rootfs
+//   root               root= of the cmdline      virtiofs tag rootfs, or the
+//                                                disk /urunc-rootfs-lower
+//                                                names (by serial, read-only)
 //   tmpfs overlay      with /urunc-overlay       without /urunc-rootfs-direct,
-//                                                direct mount when it fails
+//                                                direct mount when it fails;
+//                                                the upper /urunc-rootfs-upper
+//                                                names (disk or virtiofs) or a
+//                                                tmpfs, every failure final
+//                                                with a disk or virtiofs layer
 //   /run/urunc         copy of this binary and an urunit-agent symlink
 //   /urunit.conf       copy, URUNIT_CONFIG       ignored
 //   /urunc-mounts      virtiofs mounts           virtiofs mounts
@@ -490,6 +496,134 @@ char *init_mount_opts(const char *opts, unsigned long *flags)
 	return data;
 }
 
+// Returns whether s is a disk serial as hull assigns them (disk<N>): not
+// empty, at most the 20 bytes virtio-blk carries, and nothing that could
+// break a marker field.
+static int init_valid_serial(const char *s, size_t n)
+{
+	size_t i;
+
+	if (n == 0 || n > 20)
+		return 0;
+	for (i = 0; i < n; i++) {
+		char ch = s[i];
+
+		if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		      (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' ||
+		      ch == '-'))
+			return 0;
+	}
+	return 1;
+}
+
+// Returns the length of line without trailing white space.
+static size_t init_trimmed_len(const char *line)
+{
+	size_t n = strlen(line);
+
+	while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+			 line[n - 1] == ' ' || line[n - 1] == '\t'))
+		n--;
+	return n;
+}
+
+int init_parse_lower(const char *line, char **serial, char **fstype)
+{
+	size_t n = init_trimmed_len(line);
+	const char *rest;
+	const char *colon;
+	size_t i;
+
+	if (n < 6 || strncmp(line, "block:", 6) != 0)
+		return -1;
+	rest = line + 6;
+	colon = memchr(rest, ':', n - 6);
+	if (colon == NULL ||
+	    !init_valid_serial(rest, (size_t)(colon - rest)) ||
+	    colon + 1 == line + n)
+		return -1;
+	for (i = (size_t)(colon + 1 - line); i < n; i++)
+		if (!((line[i] >= 'a' && line[i] <= 'z') ||
+		      (line[i] >= '0' && line[i] <= '9')))
+			return -1;
+	*serial = init_strndup(rest, (size_t)(colon - rest));
+	*fstype = init_strndup(colon + 1, (size_t)(line + n - colon - 1));
+	if (*serial == NULL || *fstype == NULL) {
+		free(*serial);
+		free(*fstype);
+		*serial = NULL;
+		*fstype = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+int init_parse_upper(const char *line, enum init_upper_kind *kind,
+		     char **serial)
+{
+	size_t n = init_trimmed_len(line);
+
+	*serial = NULL;
+	if (n == 0) {
+		*kind = INIT_UPPER_TMPFS;
+		return 0;
+	}
+	if (n == 8 && strncmp(line, "virtiofs", 8) == 0) {
+		*kind = INIT_UPPER_VIRTIOFS;
+		return 0;
+	}
+	if (n == 5 && strncmp(line, "block", 5) == 0) {
+		*kind = INIT_UPPER_BLOCK;
+		return 0;
+	}
+	if (n > 6 && strncmp(line, "block:", 6) == 0 &&
+	    init_valid_serial(line + 6, n - 6)) {
+		*serial = init_strndup(line + 6, n - 6);
+		if (*serial == NULL)
+			return -1;
+		*kind = INIT_UPPER_BLOCK;
+		return 0;
+	}
+	return -1;
+}
+
+// hull knows the serial of every disk it attaches, so nothing here depends
+// on the order the guest probed them in. The kernel cuts the serial at 20
+// bytes and drops the NUL padding; virtio probing is done before init runs,
+// and the retries only cover a slow disk.
+char *init_dev_by_serial(const struct sysops *ops, const char *serial,
+			 int tries)
+{
+	char path[64];
+	char dev[16];
+	int t;
+	char d;
+
+	for (t = 0; t < tries; t++) {
+		if (t > 0)
+			ops->nap(100);
+		for (d = 'a'; d <= 'z'; d++) {
+			size_t len = 0;
+			char *got;
+			int match;
+
+			snprintf(path, sizeof(path), "/sys/block/vd%c/serial", d);
+			got = ops->read_file(path, &len);
+			if (got == NULL)
+				continue;
+			while (len > 0 && (got[len - 1] == '\n' ||
+					   got[len - 1] == ' '))
+				got[--len] = '\0';
+			match = strcmp(got, serial) == 0;
+			free(got);
+			snprintf(dev, sizeof(dev), "/dev/vd%c", d);
+			if (match && ops->exists(dev) == 0)
+				return strdup(dev);
+		}
+	}
+	return NULL;
+}
+
 static void init_set_clock(const struct init_ctx *c)
 {
 	size_t len;
@@ -546,8 +680,22 @@ static int init_rosetta(const struct init_ctx *c)
 // Mounts the root at /newroot, under a tmpfs overlay when overlay is set.
 // In vz-init mode an overlay that cannot be mounted falls back to the
 // direct mount.
+// The upper layer of the overlay: what to mount on /run/urunc-overlay.
+struct init_upper {
+	const char *src;
+	const char *type;
+	const char *what;
+};
+
+static const struct init_upper init_upper_tmpfs = { "tmpfs", "tmpfs",
+						    "tmpfs" };
+
+// Mounts the root at /newroot, under an overlay when overlay is set. With
+// final set, as for a block lower or a persistent upper, every failure ends
+// the boot: there is no virtiofs root to fall back to.
 static int init_mount_root(const struct init_ctx *c, const char *root,
-			   const char *fstype, const char *opts, int overlay)
+			   const char *fstype, const char *opts, int overlay,
+			   const struct init_upper *upper, int final)
 {
 	const struct sysops *ops = c->ops;
 	const char *lower = overlay ? INIT_LOWERROOT : INIT_NEWROOT;
@@ -572,7 +720,14 @@ static int init_mount_root(const struct init_ctx *c, const char *root,
 
 	ops->mkdir_p(INIT_NEWROOT, 0755);
 	ops->mkdir_p(INIT_OVERLAY_DIR, 0755);
-	rc = ops->mount("tmpfs", INIT_OVERLAY_DIR, "tmpfs", 0, NULL);
+	rc = ops->mount(upper->src, INIT_OVERLAY_DIR, upper->type, 0, NULL);
+	if (rc != 0 && final) {
+		snprintf(msg, sizeof(msg), "could not mount the %s upper layer",
+			 upper->what);
+		init_failed(c, rc, msg);
+		free(data);
+		return 1;
+	}
 	if (rc == 0) {
 		ops->mkdir_p(INIT_OVERLAY_DIR "/upper", 0755);
 		ops->mkdir_p(INIT_OVERLAY_DIR "/work", 0755);
@@ -585,7 +740,7 @@ static int init_mount_root(const struct init_ctx *c, const char *root,
 		free(data);
 		return 0;
 	}
-	if (c->strict) {
+	if (c->strict || final) {
 		snprintf(msg, sizeof(msg), "could not mount the overlay over %s",
 			 root);
 		init_failed(c, rc, msg);
@@ -898,6 +1053,103 @@ static char **init_command(const struct init_ctx *c, int argc, char **argv,
 	return out;
 }
 
+// Sets the layers of a vz-init root. The lower is the disk
+// /urunc-rootfs-lower names, mounted read-only, or the virtiofs tag rootfs
+// without it. With an overlay, /urunc-rootfs-upper names the upper: a disk,
+// the virtiofs tag rootfs-upper, or a tmpfs without it. A named disk that is
+// missing ends the boot, and so does any marker that does not parse.
+static int init_vz_layers(const struct init_ctx *c, int overlay, char **root,
+			  char **fstype, char **flags,
+			  struct init_upper *upper, char **upper_dev,
+			  int *final)
+{
+	char *lower = init_slurp(c, "/urunc-rootfs-lower", NULL);
+	char *line = NULL;
+	char *serial = NULL;
+	enum init_upper_kind kind;
+	int rc = 1;
+
+	if (lower == NULL) {
+		*root = strdup("rootfs");
+		*fstype = strdup("virtiofs");
+		if (*root == NULL || *fstype == NULL) {
+			init_log(c, "out of memory");
+			goto out;
+		}
+	} else {
+		if (!overlay) {
+			init_log(c, "/urunc-rootfs-direct and "
+				    "/urunc-rootfs-lower are both present");
+			goto out;
+		}
+		if (init_parse_lower(lower, &serial, fstype) != 0) {
+			init_log(c, "cannot parse /urunc-rootfs-lower: '%.*s'",
+				 (int)init_trimmed_len(lower), lower);
+			goto out;
+		}
+		*root = init_dev_by_serial(c->ops, serial, 20);
+		if (*root == NULL) {
+			init_log(c, "no virtio-blk disk with serial %s for the "
+				    "lower layer", serial);
+			goto out;
+		}
+		*flags = strdup("ro");
+		*final = 1;
+		free(serial);
+		serial = NULL;
+	}
+	if (!overlay) {
+		rc = 0;
+		goto out;
+	}
+
+	line = init_slurp(c, "/urunc-rootfs-upper", NULL);
+	if (line == NULL) {
+		rc = 0;
+		goto out;
+	}
+	if (init_parse_upper(line, &kind, &serial) != 0) {
+		init_log(c, "cannot parse /urunc-rootfs-upper: '%.*s'",
+			 (int)init_trimmed_len(line), line);
+		goto out;
+	}
+	switch (kind) {
+	case INIT_UPPER_TMPFS:
+		break;
+	case INIT_UPPER_VIRTIOFS:
+		upper->src = "rootfs-upper";
+		upper->type = "virtiofs";
+		upper->what = "virtiofs";
+		*final = 1;
+		break;
+	case INIT_UPPER_BLOCK:
+		*upper_dev = serial != NULL
+				     ? init_dev_by_serial(c->ops, serial, 20)
+				     : strdup("/dev/vda");
+		if (*upper_dev == NULL) {
+			init_log(c, "no virtio-blk disk with serial %s for the "
+				    "upper layer", serial);
+			goto out;
+		}
+		if (lower != NULL && strcmp(*upper_dev, *root) == 0) {
+			init_log(c, "the upper layer %s is also the lower layer",
+				 *upper_dev);
+			goto out;
+		}
+		upper->src = *upper_dev;
+		upper->type = "ext4";
+		upper->what = "block";
+		*final = 1;
+		break;
+	}
+	rc = 0;
+out:
+	free(lower);
+	free(line);
+	free(serial);
+	return rc;
+}
+
 int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	     char **argv, const char *cmdline, int *out_argc,
 	     char ***out_argv)
@@ -907,8 +1159,11 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	char *root = NULL;
 	char *fstype = NULL;
 	char *flags = NULL;
+	char *upper_dev = NULL;
+	struct init_upper upper = init_upper_tmpfs;
 	char **out;
 	int overlay;
+	int final = 0;
 	int rc = 1;
 
 	c.ops = ops;
@@ -950,16 +1205,13 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 		}
 		overlay = init_exists(&c, "/urunc-overlay");
 	} else {
-		root = strdup("rootfs");
-		fstype = strdup("virtiofs");
-		if (root == NULL || fstype == NULL) {
-			init_log(&c, "out of memory");
-			goto out;
-		}
 		overlay = !init_exists(&c, "/urunc-rootfs-direct");
+		if (init_vz_layers(&c, overlay, &root, &fstype, &flags, &upper,
+				   &upper_dev, &final))
+			goto out;
 	}
 
-	if (init_mount_root(&c, root, fstype, flags, overlay))
+	if (init_mount_root(&c, root, fstype, flags, overlay, &upper, final))
 		goto out;
 	// The two scripts differ in order and the order matters when an
 	// export covers /tmp, /etc or /run. container-init stages the binary,
@@ -1011,6 +1263,7 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	rc = 0;
 out:
 	free(cmdline_buf);
+	free(upper_dev);
 	free(root);
 	free(fstype);
 	free(flags);
