@@ -17,6 +17,25 @@ The key features of `urunit` are:
 - Reading and setting the environment variables for an application from a file.
 - Reading and setting the execution environment configuration for a process from a file.
 - Reading and mounting attached block devices defined in the configuration file.
+- Serving `urunc exec` sessions with a built-in agent, started as a child of
+  `urunit` before the application when a container boot staged the binary at
+  `/run/urunc/urunit`. Once the application exits the agent gets `SIGTERM`.
+- Running as the early init of a urunc generic container boot (Linux only).
+
+### Roles
+
+`urunit` picks its role from the name it runs under (`argv[0]`), or from
+`URUNIT_MODE` (`init`, `vz-init`, `agent` or `supervise`) when that is set:
+
+| Name | Role |
+|------|------|
+| `urunit` | the supervisor of the application (PID 1) |
+| `init` | the early init of a container boot: it mounts the container root from the kernel command line (`root=`, `rootfstype=`), switches to it and becomes the supervisor |
+| `vz-init` | the same for hull on macOS: the root is the virtiofs tag `rootfs`, and the `/urunc-*` files of the initrd configure it |
+| `urunit-agent` | the exec agent alone |
+
+A container boot initrd needs only `/urunit`, with `/init` and `/vz-init` as
+symlinks to it. On FreeBSD `urunit` is always the supervisor.
 
 ## Building
 
@@ -27,6 +46,7 @@ a C compiler is installed. In particular:
 - `make static_debug`: builds `urunit` as a statically-linked binary enabling debug messages
 - `make dynamic`: builds `urunit` as a dynamically-linked binary
 - `make dynamic_debug`: builds `urunit` as a dynamically-linked binary enabling debug messages
+- `make check`: builds and runs the unit tests (Linux only)
 
 
 > **NOTE**: The default build target is `make static`, hence running `make`

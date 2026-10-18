@@ -1421,11 +1421,18 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 // agent binary. Any other boot (e.g. urunit as
 // the init of a unikernel rootfs) runs no agent.
 //
+// URUNIT_STAGED_BIN in the environment names another file to check, so that
+// the tests can run the supervisor without writing to /run/urunc. The guest
+// never sets it.
+//
 // Return value:
 // 1 if the agent should be started, otherwise 0.
 static int should_spawn_agent(void) {
 #ifdef __linux__
-	return access(URUNIT_STAGED_BIN, X_OK) == 0;
+	const char *path = getenv("URUNIT_STAGED_BIN");
+
+	return access(path != NULL && path[0] != '\0' ? path :
+		      URUNIT_STAGED_BIN, X_OK) == 0;
 #else
 	// The agent and the early init are Linux only.
 	return 0;
