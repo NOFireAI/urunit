@@ -34,6 +34,11 @@ The key features of `urunit` are:
 | `vz-init` | the same for hull on macOS: the root is the virtiofs tag `rootfs`, and the `/urunc-*` files of the initrd configure it |
 | `urunit-agent` | the exec agent alone |
 
+In both early-init roles `/urunc-rootfs-lower` replaces the default root: the
+root is an overlay on the read-only disk it names (`block:<serial>:<fstype>`),
+with the upper `/urunc-rootfs-upper` names. Disks are found by their
+virtio-blk serial, and every failure ends the boot.
+
 A container boot initrd needs only `/urunit`, with `/init` and `/vz-init` as
 symlinks to it. On FreeBSD `urunit` is always the supervisor.
 

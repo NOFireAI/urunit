@@ -32,6 +32,10 @@
 //   cannot be mounted, an empty command and a failed switch_root still end
 //   it.
 //
+// In both modes /urunc-rootfs-lower replaces that default: the root is an
+// overlay on the read-only disk it names, with the upper /urunc-rootfs-upper
+// names. init then refuses a root= on the kernel command line too.
+//
 // Linux hosts append only /urunit.conf to the initrd. hull has no bind
 // mounts to prepare the root with, so it appends the /urunc-* files too.
 // A step named after a file runs only when that file is present.
@@ -40,15 +44,13 @@
 //   /proc /sys /dev    mount                     mount
 //   /urunc-epoch       set the clock             set the clock
 //   /urunc-rosetta     register Rosetta          register Rosetta
-//   root               root= of the cmdline      virtiofs tag rootfs, or the
-//                                                disk /urunc-rootfs-lower
-//                                                names (by serial, read-only)
+//   root               root= of the cmdline      virtiofs tag rootfs
 //   tmpfs overlay      with /urunc-overlay       without /urunc-rootfs-direct,
-//                                                direct mount when it fails;
-//                                                the upper /urunc-rootfs-upper
-//                                                names (disk or virtiofs) or a
-//                                                tmpfs, every failure final
-//                                                with a disk or virtiofs layer
+//                                                direct mount when it fails
+//   layered root       the disk /urunc-rootfs-lower names (by serial,
+//                      read-only) under an overlay; the upper is the one
+//                      /urunc-rootfs-upper names (disk or virtiofs) or a
+//                      tmpfs. Every failure is final in both modes.
 //   /run/urunc         copy of this binary and an urunit-agent symlink
 //   /urunit.conf       copy, URUNIT_CONFIG       ignored
 //   /urunc-mounts      virtiofs mounts           virtiofs mounts
@@ -1053,12 +1055,13 @@ static char **init_command(const struct init_ctx *c, int argc, char **argv,
 	return out;
 }
 
-// Sets the layers of a vz-init root. The lower is the disk
-// /urunc-rootfs-lower names, mounted read-only, or the virtiofs tag rootfs
-// without it. With an overlay, /urunc-rootfs-upper names the upper: a disk,
-// the virtiofs tag rootfs-upper, or a tmpfs without it. A named disk that is
-// missing ends the boot, and so does any marker that does not parse.
-static int init_vz_layers(const struct init_ctx *c, int overlay, char **root,
+// Sets the layers of a root the /urunc-rootfs-* markers describe. The lower
+// is the disk /urunc-rootfs-lower names, mounted read-only, or the virtiofs
+// tag rootfs without it (vz-init only). With an overlay, /urunc-rootfs-upper
+// names the upper: a disk, the virtiofs tag rootfs-upper, or a tmpfs without
+// it. A named disk that is missing ends the boot, and so does any marker that
+// does not parse.
+static int init_layers(const struct init_ctx *c, int overlay, char **root,
 			  char **fstype, char **flags,
 			  struct init_upper *upper, char **upper_dev,
 			  int *final)
@@ -1163,6 +1166,7 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	struct init_upper upper = init_upper_tmpfs;
 	char **out;
 	int overlay;
+	int layered;
 	int final = 0;
 	int rc = 1;
 
@@ -1188,6 +1192,10 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	if (init_rosetta(&c))
 		return 1;
 
+	// The markers decide the root in both modes. Without them, init takes
+	// it from the kernel command line and vz-init from the virtiofs tag
+	// rootfs.
+	layered = !c.strict || init_exists(&c, "/urunc-rootfs-lower");
 	if (c.strict) {
 		if (cmdline == NULL) {
 			cmdline_buf = ops->read_file("/proc/cmdline", NULL);
@@ -1195,6 +1203,19 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 		}
 		if (init_parse_cmdline_root(cmdline, &root, &fstype, &flags)) {
 			init_log(&c, "out of memory");
+			goto out;
+		}
+	}
+	if (c.strict && layered &&
+	    (root != NULL || fstype != NULL || flags != NULL)) {
+		init_log(&c, "/urunc-rootfs-lower and a root on the kernel "
+			     "command line are both present");
+		goto out;
+	}
+	if (!layered) {
+		if (init_exists(&c, "/urunc-rootfs-upper")) {
+			init_log(&c, "/urunc-rootfs-upper without "
+				     "/urunc-rootfs-lower");
 			goto out;
 		}
 		if (root == NULL || root[0] == '\0' || fstype == NULL ||
@@ -1206,8 +1227,8 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 		overlay = init_exists(&c, "/urunc-overlay");
 	} else {
 		overlay = !init_exists(&c, "/urunc-rootfs-direct");
-		if (init_vz_layers(&c, overlay, &root, &fstype, &flags, &upper,
-				   &upper_dev, &final))
+		if (init_layers(&c, overlay, &root, &fstype, &flags, &upper,
+				&upper_dev, &final))
 			goto out;
 	}
 

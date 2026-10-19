@@ -1094,6 +1094,120 @@ static void test_vz_overlay_block_fails(void)
 	}
 }
 
+// Scenario: urunc's overlay-block root on a Linux host. init takes the
+// layers from the markers, as vz-init does, and keeps its own order: the
+// staged binary and urunit.conf, then the exports.
+static void test_init_overlay_block(void)
+{
+	char *argv[] = { "/init", "/bin/true", NULL };
+	char **out = NULL;
+	int out_argc = 0;
+	int rc;
+
+	fake_reset();
+	fake_add("/urunit.conf", "UES:\nUEE:\n", 0);
+	fake_add("/urunc-rootfs-lower", "block:disk0:ext4\n", 0);
+	fake_add("/urunc-rootfs-upper", "block:disk1\n", 0);
+	fake_add("/urunc-mounts", "share0\t/work/proj\trw\n", 0);
+	fake_add("/sys/block/vda/serial", "disk1", 0);
+	fake_add("/sys/block/vdb/serial", "disk0", 0);
+	fake_add("/dev/vda", "", 0);
+	fake_add("/dev/vdb", "", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 2, argv,
+		      "console=ttyS0 panic=-1 rdinit=/init -- /bin/true",
+		      &out_argc, &out);
+	CHECK_EQ_INT(rc, 0);
+	CHECK_CALLS(EARLY_MOUNTS,
+		    "mkdir_p /lowerroot 755",
+		    "mount /dev/vdb /lowerroot ext4 ro -",
+		    "mkdir_p /newroot 755",
+		    "mkdir_p /run/urunc-overlay 755",
+		    "mount /dev/vda /run/urunc-overlay ext4 0 -",
+		    "mkdir_p /run/urunc-overlay/upper 755",
+		    "mkdir_p /run/urunc-overlay/work 755",
+		    "mount overlay /newroot overlay 0 lowerdir=/lowerroot,"
+		    "upperdir=/run/urunc-overlay/upper,"
+		    "workdir=/run/urunc-overlay/work",
+		    STAGE_BIN,
+		    STAGE_CONF,
+		    "mkdir_p /newroot/work/proj 755",
+		    "mount share0 /newroot/work/proj virtiofs 0 -",
+		    DEFAULT_HOSTS,
+		    MOVE_MOUNTS,
+		    "switch_root /newroot");
+	if (rc == 0)
+		CHECK_ARGV(out, out_argc, "urunit", "/bin/true");
+	CHECK_EQ_STR(fake_console, "");
+	free_argv(out);
+}
+
+// init refuses what it cannot tell apart: markers next to a root on the
+// command line, and an upper with no lower. A missing disk or a failed
+// mount ends the boot as in vz-init.
+static void test_init_overlay_block_fails(void)
+{
+	static const struct {
+		const char *lower;
+		const char *upper;
+		const char *cmdline;
+		const char *fail;
+		const char *msg;
+	} cases[] = {
+		{ "block:disk0:ext4", "block:disk1",
+		  "root=/dev/vda rootfstype=ext4",  NULL,
+		  "/urunc-rootfs-lower and a root on the kernel command line" },
+		{ "block:disk0:ext4", NULL, "rootfstype=virtiofs", NULL,
+		  "/urunc-rootfs-lower and a root on the kernel command line" },
+		{ NULL, "block:disk1", "root=fs0 rootfstype=virtiofs", NULL,
+		  "/urunc-rootfs-upper without /urunc-rootfs-lower" },
+		{ "block:disk9:ext4", "block:disk1", "", NULL,
+		  "no virtio-blk disk with serial disk9 for the lower layer" },
+		{ "block:disk0:ext4", "block:disk8", "", NULL,
+		  "no virtio-blk disk with serial disk8 for the upper layer" },
+		{ "block:disk0:ext4", "block:disk1", "",
+		  "mount /dev/vda /lowerroot",
+		  "could not mount ext4 root /dev/vda" },
+		{ "block:disk0:ext4", "block:disk1", "",
+		  "mount /dev/vdb /run/urunc-overlay",
+		  "could not mount the block upper layer" },
+		{ "block:disk0:ext4", NULL, "", "mount overlay ",
+		  "could not mount the overlay over /dev/vda" },
+	};
+	char *argv[] = { "/init", "/bin/true", NULL };
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		char **out = NULL;
+		int out_argc = 0;
+		int rc;
+
+		fake_reset();
+		fake_add("/urunit.conf", "UES:\nUEE:\n", 0);
+		if (cases[i].lower != NULL)
+			fake_add("/urunc-rootfs-lower", cases[i].lower, 0);
+		if (cases[i].upper != NULL)
+			fake_add("/urunc-rootfs-upper", cases[i].upper, 0);
+		fake_add("/sys/block/vda/serial", "disk0", 0);
+		fake_add("/sys/block/vdb/serial", "disk1", 0);
+		fake_add("/dev/vda", "", 0);
+		fake_add("/dev/vdb", "", 0);
+		fake_fail[0] = cases[i].fail;
+		rc = init_run(&fake_ops, URUNIT_MODE_INIT, 2, argv,
+			      cases[i].cmdline, &out_argc, &out);
+		if (rc == 0)
+			HARNESS_FAIL("init case %zu booted", i);
+		if (strstr(fake_console, cases[i].msg) == NULL)
+			HARNESS_FAIL("init case %zu: want '%s' on the console, "
+				     "got '%s'", i, cases[i].msg, fake_console);
+		if (strstr(fake_calls, " /newroot ext4 ") != NULL ||
+		    strstr(fake_calls, " /newroot virtiofs ") != NULL)
+			HARNESS_FAIL("init case %zu mounted a direct root", i);
+		if (strstr(fake_calls, "switch_root") != NULL)
+			HARNESS_FAIL("init case %zu switched root", i);
+		free_argv(out);
+	}
+}
+
 static void test_init_parsers(void)
 {
 	const char *tsv = "a\t/x\tro\nb\t/y\n\tc\n\nd\t/z\trw";
@@ -1143,6 +1257,8 @@ int run_init_tests(void)
 	test_dev_by_serial();
 	test_vz_overlay_block();
 	test_vz_overlay_block_fails();
+	test_init_overlay_block();
+	test_init_overlay_block_fails();
 	test_vz_full();
 	test_vz_overlay_fallback();
 	test_vz_rootfs_fails();
