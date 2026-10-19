@@ -34,6 +34,7 @@ enum urunit_mode {
 	URUNIT_MODE_INIT,
 	URUNIT_MODE_VZ_INIT,
 	URUNIT_MODE_AGENT,
+	URUNIT_MODE_SIGNAL,
 };
 
 // The directory of the new root where init places a copy of the binary and
@@ -43,7 +44,7 @@ static const char URUNIT_STAGED_BIN[] = "/run/urunc/urunit";
 static const char URUNIT_STAGED_CONF[] = "/run/urunc/urunit.conf";
 
 // Returns the mode for the program name argv0 and the value of URUNIT_MODE.
-// A known env_mode (init, vz-init, agent, supervise) wins. Otherwise the
+// A known env_mode (init, vz-init, agent, supervise, signal) wins. Otherwise the
 // base name of argv0 decides: init, vz-init and urunit-agent select their
 // mode and any other name selects URUNIT_MODE_SUPERVISE.
 enum urunit_mode urunit_mode_from(const char *argv0, const char *env_mode);
@@ -56,6 +57,20 @@ int init_main(enum urunit_mode mode, int argc, char **argv);
 // Runs argv[1..] as the container application and supervises it. It
 // returns only on error. Otherwise it reboots or powers off the guest.
 int supervise_main(int argc, char **argv);
+
+// Sends the signal argv[1] names, a number, to PID 1: the supervisor, which
+// forwards it to the application. urunc runs it through the exec agent to
+// stop a guest, so that the application gets the signal and the shutdown
+// syncs the disks. Returns 0 when the signal was sent.
+int signal_init_main(int argc, char **argv);
+
+// Returns the signal number s names, or -1 when it is not a number from 1
+// to 64.
+int parse_signal_number(const char *s);
+
+// Forwards SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 to app_pid
+// from now on. Defined in main.c.
+void forward_signals(pid_t app_pid);
 
 // Serves exec sessions until the process is killed. It returns non-zero
 // only when no transport can ever be set up.

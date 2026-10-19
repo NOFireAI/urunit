@@ -25,7 +25,7 @@ The key features of `urunit` are:
 ### Roles
 
 `urunit` picks its role from the name it runs under (`argv[0]`), or from
-`URUNIT_MODE` (`init`, `vz-init`, `agent` or `supervise`) when that is set:
+`URUNIT_MODE` (`init`, `vz-init`, `agent`, `supervise` or `signal`) when that is set:
 
 | Name | Role |
 |------|------|
@@ -33,6 +33,11 @@ The key features of `urunit` are:
 | `init` | the early init of a container boot: it mounts the container root from the kernel command line (`root=`, `rootfstype=`), switches to it and becomes the supervisor |
 | `vz-init` | the same for hull on macOS: the root is the virtiofs tag `rootfs`, and the `/urunc-*` files of the initrd configure it |
 | `urunit-agent` | the exec agent alone |
+| `URUNIT_MODE=signal` | sends the signal number in `argv[1]` to PID 1. urunc runs `/run/urunc/urunit` this way through the exec agent to stop a guest |
+
+The supervisor forwards SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2
+to the application. As PID 1 it would otherwise drop them. When the
+application exits, the supervisor syncs and reboots or powers off the guest.
 
 In both early-init roles `/urunc-rootfs-lower` replaces the default root: the
 root is an overlay on the read-only disk it names (`block:<serial>:<fstype>`),

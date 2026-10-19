@@ -31,6 +31,8 @@ int main(int argc, char **argv)
 	case URUNIT_MODE_AGENT:
 		agentlog_init();
 		return agent_main();
+	case URUNIT_MODE_SIGNAL:
+		return signal_init_main(argc, argv);
 	case URUNIT_MODE_SUPERVISE:
 	default:
 		return supervise_main(argc, argv);

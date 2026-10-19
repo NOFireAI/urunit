@@ -32,6 +32,8 @@ enum urunit_mode urunit_mode_from(const char *argv0, const char *env_mode)
 			return URUNIT_MODE_AGENT;
 		if (strcmp(env_mode, "supervise") == 0)
 			return URUNIT_MODE_SUPERVISE;
+		if (strcmp(env_mode, "signal") == 0)
+			return URUNIT_MODE_SIGNAL;
 	}
 	if (argv0 == NULL)
 		return URUNIT_MODE_SUPERVISE;

@@ -16,13 +16,58 @@
 // (a sidecar inherited by PID 1) is still running and ignores SIGTERM.
 
 #include <signal.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "harness.h"
+#include "urunit.h"
 
 int reap(const pid_t child_pid, int *child_exitcode_ptr);
+
+// A SIGTERM to the supervisor reaches the application, which dies of it, and
+// reap() reports 128 + 15. As PID 1 the supervisor would otherwise drop it.
+static void test_forward_sigterm(void)
+{
+	static const int sigs[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
+	int code = -1;
+	pid_t app;
+	size_t i;
+
+	app = fork();
+	if (app == 0) {
+		for (;;)
+			pause();
+	}
+	CHECK(app > 0);
+	if (app < 0)
+		return;
+	forward_signals(app);
+	CHECK_EQ_INT(raise(SIGTERM), 0);
+	// Wait up to 5 s for the application to die, without reaping it, so
+	// that a signal that was not forwarded fails here instead of blocking
+	// reap() for ever.
+	for (i = 0; i < 500; i++) {
+		siginfo_t si;
+
+		memset(&si, 0, sizeof(si));
+		if (waitid(P_PID, (id_t)app, &si, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+		    si.si_pid == app)
+			break;
+		usleep(10000);
+	}
+	if (i == 500) {
+		HARNESS_FAIL("the SIGTERM did not reach the application");
+		kill(app, SIGKILL);
+	}
+	CHECK_EQ_INT(reap(app, &code), 0);
+	CHECK_EQ_INT(code, i == 500 ? 128 + SIGKILL : 128 + SIGTERM);
+
+	forward_signals(0);
+	for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+		signal(sigs[i], SIG_DFL);
+}
 
 int run_reap_tests(void)
 {
@@ -30,6 +75,8 @@ int run_reap_tests(void)
 	int code = -1;
 	int status = 0;
 	pid_t sidecar, app, done;
+
+	test_forward_sigterm();
 
 	sidecar = fork();
 	if (sidecar == 0) {

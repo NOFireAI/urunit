@@ -44,6 +44,28 @@ int run_mode_tests(void)
 	CHECK_EQ_INT(urunit_mode_from("/vz-init", "bogus"),
 		     URUNIT_MODE_VZ_INIT);
 	CHECK_EQ_INT(urunit_mode_from("/vz-init", ""), URUNIT_MODE_VZ_INIT);
+	// The signal role has no name of its own: urunc asks for it through
+	// URUNIT_MODE on the staged /run/urunc/urunit.
+	CHECK_EQ_INT(urunit_mode_from("/run/urunc/urunit", "signal"),
+		     URUNIT_MODE_SIGNAL);
+
+	CHECK_EQ_INT(parse_signal_number("15"), 15);
+	CHECK_EQ_INT(parse_signal_number("1"), 1);
+	CHECK_EQ_INT(parse_signal_number("64"), 64);
+	CHECK_EQ_INT(parse_signal_number("0"), -1);
+	CHECK_EQ_INT(parse_signal_number("65"), -1);
+	CHECK_EQ_INT(parse_signal_number("-15"), -1);
+	CHECK_EQ_INT(parse_signal_number("TERM"), -1);
+	CHECK_EQ_INT(parse_signal_number("15x"), -1);
+	CHECK_EQ_INT(parse_signal_number(""), -1);
+	CHECK_EQ_INT(parse_signal_number(NULL), -1);
+	{
+		char *one[] = { "urunit", NULL };
+		char *bad[] = { "urunit", "TERM", NULL };
+
+		CHECK_EQ_INT(signal_init_main(1, one), 2);
+		CHECK_EQ_INT(signal_init_main(2, bad), 2);
+	}
 
 	return harness_failures - start;
 }

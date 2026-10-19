@@ -69,6 +69,9 @@
 // The pid of the agent urunit started, 0 when there is none or it was reaped.
 static pid_t agent_pid = 0;
 
+// The pid of the application, for forward_signal. 0 until it runs.
+static volatile pid_t forward_pid = 0;
+
 extern char **environ;
 
 int isolate_child(void) {
@@ -1348,6 +1351,10 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 			if (errno == ECHILD) {
 				break;
 			}
+			// A forwarded signal interrupted the wait.
+			if (errno == EINTR) {
+				continue;
+			}
 			perror("reaping");
 			return 1;
 
@@ -1455,6 +1462,67 @@ int wants_default_route(void) {
 	return set;
 }
 
+// forward_signal: Sends a signal urunit received to the application. As PID
+// 1, urunit gets only the signals it handles, so without this a SIGTERM to
+// the guest init does nothing.
+static void forward_signal(int sig) {
+	pid_t pid = forward_pid;
+
+	if (pid > 0) {
+		kill(pid, sig);
+	}
+}
+
+// forward_signals: Forwards the signals that ask a process to stop, or that
+// an application handles itself, to the application app_pid. It runs after
+// the agent and the application are forked, so neither inherits the handler.
+// SA_RESTART keeps the waitpid() of reap() going.
+void forward_signals(pid_t app_pid) {
+	static const int sigs[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 };
+	struct sigaction sa;
+	size_t i;
+
+	forward_pid = app_pid;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = forward_signal;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+		if (sigaction(sigs[i], &sa, NULL) < 0) {
+			perror("sigaction");
+		}
+	}
+}
+
+int parse_signal_number(const char *s) {
+	char *end;
+	long n;
+
+	if (s == NULL || *s == '\0') {
+		return -1;
+	}
+	errno = 0;
+	n = strtol(s, &end, 10);
+	if (errno != 0 || *end != '\0' || n < 1 || n > 64) {
+		return -1;
+	}
+	return (int)n;
+}
+
+int signal_init_main(int argc, char **argv) {
+	int sig = argc == 2 ? parse_signal_number(argv[1]) : -1;
+
+	if (sig < 0) {
+		fprintf(stderr, "usage: URUNIT_MODE=signal urunit <signal number>\n");
+		return 2;
+	}
+	if (kill(1, sig) < 0) {
+		perror("kill 1");
+		return 1;
+	}
+	return 0;
+}
+
 int supervise_main(int argc, char *argv[]) {
 	pid_t app_pid;
 	int ret = 0;
@@ -1500,6 +1568,7 @@ int supervise_main(int argc, char *argv[]) {
 		fprintf(stderr, "Could not spawn app\n");
 		return ret;
 	}
+	forward_signals(app_pid);
 
 	DEBUG_PRINT("Starting reaping loop\n");
 	while (1) {
