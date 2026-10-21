@@ -69,6 +69,12 @@
 // The pid of the agent urunit started, 0 when there is none or it was reaped.
 static pid_t agent_pid = 0;
 
+void (*urunit_sync)(void) = sync;
+
+void set_agent_pid(pid_t pid) {
+	agent_pid = pid;
+}
+
 // The pid of the application, for forward_signal. 0 until it runs.
 static volatile pid_t forward_pid = 0;
 
@@ -1383,6 +1389,12 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 
 				// Be safe, ensure the status code is indeed between 0 and 255.
 				*child_exitcode_ptr = *child_exitcode_ptr % (STATUS_MAX - STATUS_MIN + 1);
+
+				// Flush the app's writes before the agent goes. Its
+				// sessions end with it, and urunc can take that for
+				// the guest going down and stop the monitor before
+				// the shutdown below syncs.
+				urunit_sync();
 
 				// The app is done. The agent urunit started would
 				// otherwise run forever, so ask it to exit. Nothing

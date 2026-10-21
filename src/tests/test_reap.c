@@ -16,6 +16,7 @@
 // (a sidecar inherited by PID 1) is still running and ignores SIGTERM.
 
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -69,6 +70,81 @@ static void test_forward_sigterm(void)
 		signal(sigs[i], SIG_DFL);
 }
 
+static pid_t stand_in_agent;
+static int sync_calls;
+static int agent_signalled_at_sync = -1;
+
+// agent_signalled reports whether pid has a SIGTERM pending or has already
+// died of it. kill(2) marks the signal pending before it returns, so either
+// shows a stop_agent() that ran first.
+static int agent_signalled(pid_t pid)
+{
+	char path[64], line[256];
+	unsigned long long mask;
+	int signalled = 0;
+	FILE *f;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+	f = fopen(path, "r");
+	if (!f)
+		return 1;
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "State:", 6) == 0 && strchr(line, 'Z'))
+			signalled = 1;
+		if ((sscanf(line, "SigPnd: %llx", &mask) == 1 ||
+		     sscanf(line, "ShdPnd: %llx", &mask) == 1) &&
+		    (mask & (1ULL << (SIGTERM - 1))))
+			signalled = 1;
+	}
+	fclose(f);
+	return signalled;
+}
+
+static void record_sync(void)
+{
+	sync_calls++;
+	agent_signalled_at_sync = agent_signalled(stand_in_agent);
+}
+
+// The guest flushes the application's writes before it stops the agent. The
+// end of the agent's sessions can make urunc stop the monitor, so a sync after
+// it can come too late.
+static void test_sync_before_agent_stops(void)
+{
+	void (*saved)(void) = urunit_sync;
+	int code = -1;
+	int status = 0;
+	pid_t app;
+
+	stand_in_agent = fork();
+	if (stand_in_agent == 0) {
+		for (;;)
+			pause();
+	}
+	CHECK(stand_in_agent > 0);
+	if (stand_in_agent < 0)
+		return;
+	app = fork();
+	if (app == 0)
+		_exit(0);
+	CHECK(app > 0);
+
+	set_agent_pid(stand_in_agent);
+	urunit_sync = record_sync;
+	alarm(10);
+	CHECK_EQ_INT(reap(app, &code), 0);
+	alarm(0);
+	urunit_sync = saved;
+	set_agent_pid(0);
+
+	CHECK_EQ_INT(code, 0);
+	CHECK_EQ_INT(sync_calls, 1);
+	CHECK_EQ_INT(agent_signalled_at_sync, 0);
+	// stop_agent() still ran after the sync.
+	CHECK_EQ_INT(waitpid(stand_in_agent, &status, 0), stand_in_agent);
+	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+}
+
 int run_reap_tests(void)
 {
 	int start = harness_failures;
@@ -77,6 +153,7 @@ int run_reap_tests(void)
 	pid_t sidecar, app, done;
 
 	test_forward_sigterm();
+	test_sync_before_agent_stops();
 
 	sidecar = fork();
 	if (sidecar == 0) {

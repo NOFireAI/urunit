@@ -81,4 +81,13 @@ int agent_main(void);
 // Defined in main.c.
 pid_t spawn_agent(void);
 
+// Flushes the filesystems once the application has exited, before the
+// supervisor stops the agent. It is sync(2); a test replaces it to check the
+// order. Defined in main.c.
+extern void (*urunit_sync)(void);
+
+// Sets the pid of the agent that reap() stops once the application exits, so
+// that a test can stand in an agent. Defined in main.c.
+void set_agent_pid(pid_t pid);
+
 #endif // URUNIT_H
