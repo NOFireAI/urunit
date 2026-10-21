@@ -111,14 +111,18 @@ The file can be specified to `urunit` setting the `URUNIT_CONFIG`
 environment variable with the path to the configuration file.
 
 The configuration file consists of records. Every record is a NUL-terminated
-string (`\0`) and the file begins with the `URUNIT1` record. Since neither
-environment variables nor arguments can contain a NUL character, every value is
-stored verbatim, even if it contains new lines (e.g. a certificate). For
-example:
+string (`\0`), section markers included. Since neither environment variables
+nor arguments can contain a NUL character, every value is stored verbatim, even
+if it contains new lines (e.g. a certificate). For example:
 
 ```
-printf 'URUNIT1\0UES\0PATH=/bin\0CERT=line1\nline2\0UEE\0' > urunit.conf
+printf 'UES\0PATH=/bin\0CERT=line1\nline2\0UEE\0' > urunit.conf
 ```
+
+urunit also reads the legacy format, where the records are lines. The first
+record tells the two apart: a NUL before the first new line means
+NUL-terminated records. A leading `URUNIT1` record, which an earlier writer
+put first, is skipped.
 
 Empty records are ignored, so the file can be padded with zeros (e.g. when it is
 exposed as a raw block device). A `PAD` record also ends the configuration and

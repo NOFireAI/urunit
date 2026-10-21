@@ -17,6 +17,7 @@
 // either side shows up here.
 
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -126,36 +127,38 @@ static void test_build_urunit_config(void)
 	free(buf);
 }
 
-// The configuration with NUL-terminated records after the URUNIT1 magic. Its
-// values are taken verbatim, so they can hold new lines, and the command comes
-// as ARC/ARV records. Everything after PAD is ignored.
-static void test_nul_records(void)
+// The records of a configuration in the NUL-terminated format, as urunc writes
+// it. Its values are taken verbatim, so they can hold new lines and text that
+// looks like a marker, and the command comes as ARC/ARV records. Everything
+// after PAD is ignored.
+static const char nul_records[] =
+	"UES\0"
+	"PATH=/usr/bin:/bin\0"
+	"MULTI=line one\nUEE\nline three\0"
+	"UEE\0"
+	"UCS\0"
+	"UID:1000\0"
+	"GID:1000\0"
+	"WD:/work\0"
+	"ARC:3\0"
+	"ARV:/bin/sh\0"
+	"ARV:-c\0"
+	"ARV:echo hello world\0"
+	"UCE\0"
+	"UBS\0"
+	"ID:vol0\0"
+	"MP:/data\0"
+	"UBE\0"
+	"PAD\0";
+
+// check_nul_records parses the len bytes of text and checks that it holds
+// nul_records.
+static void check_nul_records(const char *text, size_t len)
 {
-	static const char conf_text[] =
-		"URUNIT1\0"
-		"UES\0"
-		"PATH=/usr/bin:/bin\0"
-		"MULTI=line one\nline two\0"
-		"UEE\0"
-		"UCS\0"
-		"UID:1000\0"
-		"GID:1000\0"
-		"WD:/work\0"
-		"ARC:3\0"
-		"ARV:/bin/sh\0"
-		"ARV:-c\0"
-		"ARV:echo hello world\0"
-		"UCE\0"
-		"UBS\0"
-		"ID:vol0\0"
-		"MP:/data\0"
-		"UBE\0"
-		"PAD\0"
-		"\0\0\0UES\0garbage\0";
 	struct app_exec_config *conf;
 	char *buf = NULL;
 
-	conf = parse_config(conf_text, sizeof(conf_text) - 1, &buf);
+	conf = parse_config(text, len, &buf);
 	CHECK(conf != NULL);
 	if (!conf)
 		return;
@@ -163,7 +166,7 @@ static void test_nul_records(void)
 	CHECK(conf->envs != NULL);
 	if (conf->envs) {
 		CHECK_EQ_STR(conf->envs[0], "PATH=/usr/bin:/bin");
-		CHECK_EQ_STR(conf->envs[1], "MULTI=line one\nline two");
+		CHECK_EQ_STR(conf->envs[1], "MULTI=line one\nUEE\nline three");
 		CHECK(conf->envs[2] == NULL);
 	}
 	CHECK_EQ_STR(conf->path_env, "PATH=/usr/bin:/bin");
@@ -193,6 +196,63 @@ static void test_nul_records(void)
 		CHECK(conf->blk_conf[1] == NULL);
 	}
 
+	free_app_config(conf);
+	free(buf);
+}
+
+// urunc writes the NUL-terminated records with nothing before them
+// (urunc-dev/urunc#1111). An earlier writer put a URUNIT1 record first, and
+// a raw block device pads the configuration, with new lines (FreeBSD) or
+// zeros, after PAD. All of them read the same.
+static void test_nul_records(void)
+{
+	char text[sizeof(nul_records) + 64];
+	size_t len = sizeof(nul_records) - 1;
+
+	check_nul_records(nul_records, len);
+
+	memcpy(text, "URUNIT1", sizeof("URUNIT1"));
+	memcpy(text + sizeof("URUNIT1"), nul_records, len);
+	check_nul_records(text, sizeof("URUNIT1") + len);
+
+	memcpy(text, nul_records, len);
+	memset(text + len, '\n', 32);
+	check_nul_records(text, len + 32);
+
+	memcpy(text, nul_records, len);
+	memset(text + len, 0, 16);
+	memcpy(text + len + 16, "UES\0garbage\0", 12);
+	check_nul_records(text, len + 28);
+}
+
+// A legacy configuration on a raw block device is followed by zeros. Its first
+// record ends with a new line, so it is still read as lines.
+static void test_legacy_with_zero_padding(void)
+{
+	static const char conf_text[] =
+		"UES\nA=1\nB=2\nUEE\nUCS\nUID:7\nGID:8\nWD:/w\nUCE\n"
+		"\0\0\0\0\0\0\0\0";
+	struct app_exec_config *conf;
+	char *buf = NULL;
+
+	CHECK(!config_has_nul_records(conf_text, sizeof(conf_text) - 1));
+	CHECK(config_has_nul_records(nul_records, sizeof(nul_records) - 1));
+	conf = parse_config(conf_text, sizeof(conf_text) - 1, &buf);
+	CHECK(conf != NULL);
+	if (!conf)
+		return;
+	CHECK(conf->envs != NULL);
+	if (conf->envs) {
+		CHECK_EQ_STR(conf->envs[0], "A=1");
+		CHECK_EQ_STR(conf->envs[1], "B=2");
+		CHECK(conf->envs[2] == NULL);
+	}
+	CHECK(conf->pr_conf != NULL);
+	if (conf->pr_conf) {
+		CHECK_EQ_INT(conf->pr_conf->uid, 7);
+		CHECK_EQ_INT(conf->pr_conf->gid, 8);
+		CHECK_EQ_STR(conf->pr_conf->wdir, "/w");
+	}
 	free_app_config(conf);
 	free(buf);
 }
@@ -293,6 +353,7 @@ int run_config_tests(void)
 
 	test_build_urunit_config();
 	test_nul_records();
+	test_legacy_with_zero_padding();
 	test_empty_sections();
 	test_fc_block_ids();
 

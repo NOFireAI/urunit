@@ -112,6 +112,7 @@ struct record_iter {
 
 char *read_exact_size(FILE *f, size_t sz);
 char *read_file_and_size(char *file, size_t *size);
+int config_has_nul_records(const char *buf, size_t size);
 char *next_record(struct record_iter *iter);
 size_t count_records(struct record_iter iter, const char *end_marker);
 int is_field(const char *rec, const char *key);

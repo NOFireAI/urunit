@@ -248,12 +248,37 @@ char *read_file_and_size(char *file, size_t *size) {
 }
 
 // The configuration consists of records. Every record is a NUL-terminated
-// string and the configuration begins with the CONFIG_MAGIC record. Since
-// neither environment variables nor arguments can contain a NUL character,
-// every value is stored verbatim, even if it contains new lines.
-// A configuration without the CONFIG_MAGIC record is in the legacy format,
-// where the records are separated with new lines instead.
+// string. Since neither environment variables nor arguments can contain a NUL
+// character, every value is stored verbatim, even if it contains new lines.
+// In the legacy format the records are separated with new lines instead. The
+// first record tells the two apart: it ends with a NUL in the current format
+// and with a new line in the legacy one.
+//
+// An earlier writer began the configuration with a CONFIG_MAGIC record. It is
+// skipped when present.
 #define CONFIG_MAGIC "URUNIT1"
+
+// config_has_nul_records: Returns whether the configuration in buf is in the
+// NUL-terminated format, i.e. a NUL comes before the first new line. A legacy
+// configuration on a raw block device has zero padding after it, but a new
+// line ends its first record.
+//
+// Arguments:
+// 1. buf:	The configuration.
+// 2. size:	Its size in bytes.
+//
+// Return value:
+// 1 for the NUL-terminated format, 0 for the legacy one.
+int config_has_nul_records(const char *buf, size_t size) {
+	for (size_t i = 0; i < size; i++) {
+		if (buf[i] == '\0')
+			return 1;
+		if (buf[i] == '\n')
+			return 0;
+	}
+
+	return 0;
+}
 
 // struct record_iter is declared in common.h.
 
@@ -757,8 +782,7 @@ void free_app_config(struct app_exec_config *config) {
 // - The block mount configuration, between the "UBS" and "UBE" records.
 // - The network configuration, between the "UNS" and "UNE" records.
 // A "PAD" record ends the configuration and everything after it is ignored.
-// The records are NUL-terminated strings after the CONFIG_MAGIC record or, in
-// the legacy format, lines.
+// The records are NUL-terminated strings or, in the legacy format, lines.
 //
 // Arguments:
 // 1. file:	The name of the file that contains the configuration.
@@ -794,9 +818,10 @@ struct app_exec_config *get_config_from_file(char *file, char **sbuf) {
 	iter.pos = buf;
 	iter.end = buf + size;
 
-	if (size >= sizeof(CONFIG_MAGIC) && memcmp(buf, CONFIG_MAGIC, sizeof(CONFIG_MAGIC)) == 0) {
+	if (config_has_nul_records(buf, size)) {
 		DEBUG_PRINT("Configuration with NUL-terminated records\n");
-		iter.pos += sizeof(CONFIG_MAGIC);
+		if (size >= sizeof(CONFIG_MAGIC) && memcmp(buf, CONFIG_MAGIC, sizeof(CONFIG_MAGIC)) == 0)
+			iter.pos += sizeof(CONFIG_MAGIC);
 	} else {
 		DEBUG_PRINT("Configuration with new line separated records (legacy)\n");
 		// Turn the new lines to NUL, so both formats get parsed the
