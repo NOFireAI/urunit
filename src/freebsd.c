@@ -745,3 +745,19 @@ void request_reboot(void) {
 	sync();
 	reboot(RB_AUTOBOOT);
 }
+
+// request_poweroff: Powers the VM off.
+void request_poweroff(void) {
+	sync();
+	reboot(RB_POWEROFF);
+}
+
+// open_power_buttons: Power buttons are not watched on FreeBSD.
+int open_power_buttons(void) {
+	return 0;
+}
+
+// power_button_pressed: Power buttons are not watched on FreeBSD.
+int power_button_pressed(void) {
+	return 0;
+}

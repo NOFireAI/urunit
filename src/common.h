@@ -78,6 +78,10 @@ void request_reboot(void);
 // The reboot(2) command request_reboot uses: LINUX_REBOOT_CMD_POWER_OFF when
 // URUNIT_POWEROFF is set, LINUX_REBOOT_CMD_RESTART otherwise.
 int reboot_command(void);
+void request_poweroff(void);
+// Subscribes to the VM's power button, and reports whether a press is pending.
+int open_power_buttons(void);
+int power_button_pressed(void);
 // Nonzero when URUNIT_DEFROUTE asks for a default route through the gateway.
 int wants_default_route(void);
 
