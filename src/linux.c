@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+#include <stdint.h>
+#include <linux/genetlink.h>
+#include <linux/netlink.h>
 #include <linux/reboot.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
@@ -609,4 +613,199 @@ void request_reboot(void) {
 	int cmd = reboot_command();
 	syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
 		cmd, NULL);
+}
+
+// request_poweroff: Powers the VM off. Cloud Hypervisor restarts the guest
+// on a reset, but exits on a power off.
+void request_poweroff(void) {
+	syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		LINUX_REBOOT_CMD_POWER_OFF, NULL);
+}
+
+// The generic netlink family and multicast group on which the kernel reports
+// ACPI events (drivers/acpi/event.c), and the event it sends. A press of the
+// ACPI power button is an event of the "button/power" device class.
+#define ACPI_EVENT_FAMILY	"acpi_event"
+#define ACPI_EVENT_GROUP	"acpi_mc_group"
+#define ACPI_GENL_ATTR_EVENT	1
+#define ACPI_POWER_BUTTON_CLASS	"button/power"
+
+struct acpi_genl_event {
+	char device_class[20];
+	char bus_id[15];
+	uint32_t type;
+	uint32_t data;
+};
+
+static int acpi_event_fd = -1;
+static uint16_t acpi_event_family = 0;
+
+// nla_find: Returns the attribute of the given type among the netlink
+// attributes in buf, len bytes long, or NULL.
+static const struct nlattr *nla_find(const void *buf, size_t len, uint16_t type) {
+	const struct nlattr *a = buf;
+
+	while (len >= NLA_HDRLEN && a->nla_len >= NLA_HDRLEN && a->nla_len <= len) {
+		if ((a->nla_type & NLA_TYPE_MASK) == type) {
+			return a;
+		}
+		if ((size_t)NLA_ALIGN(a->nla_len) >= len) {
+			break;
+		}
+		len -= NLA_ALIGN(a->nla_len);
+		a = (const struct nlattr *)((const char *)a + NLA_ALIGN(a->nla_len));
+	}
+	return NULL;
+}
+
+// nlmsg_fits: Returns 1 if the netlink message n is whole in the len bytes
+// at n.
+static int nlmsg_fits(const struct nlmsghdr *n, size_t len) {
+	return len >= sizeof(*n) && n->nlmsg_len >= sizeof(*n) && n->nlmsg_len <= len;
+}
+
+// resolve_acpi_events: Asks the generic netlink controller on fd for the id
+// of the ACPI event family and of its multicast group.
+static int resolve_acpi_events(int fd, uint16_t *family, uint32_t *group) {
+	char buf[4096] __attribute__((aligned(NLMSG_ALIGNTO)));
+	struct nlmsghdr *n = (struct nlmsghdr *)buf;
+	struct genlmsghdr *g;
+	struct nlattr *a;
+	const struct nlattr *attr, *grp;
+	size_t len, left;
+	ssize_t r;
+
+	memset(buf, 0, sizeof(buf));
+	n->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + sizeof(ACPI_EVENT_FAMILY));
+	n->nlmsg_type = GENL_ID_CTRL;
+	n->nlmsg_flags = NLM_F_REQUEST;
+	g = NLMSG_DATA(n);
+	g->cmd = CTRL_CMD_GETFAMILY;
+	g->version = 1;
+	a = (struct nlattr *)((char *)g + GENL_HDRLEN);
+	a->nla_type = CTRL_ATTR_FAMILY_NAME;
+	a->nla_len = NLA_HDRLEN + sizeof(ACPI_EVENT_FAMILY);
+	memcpy((char *)a + NLA_HDRLEN, ACPI_EVENT_FAMILY, sizeof(ACPI_EVENT_FAMILY));
+	if (send(fd, buf, n->nlmsg_len, 0) < 0) {
+		return -1;
+	}
+
+	r = recv(fd, buf, sizeof(buf), 0);
+	if (r < 0 || !nlmsg_fits(n, (size_t)r) || n->nlmsg_type == NLMSG_ERROR ||
+	    n->nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN)) {
+		return -1;
+	}
+	len = n->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+	attr = (const struct nlattr *)((char *)NLMSG_DATA(n) + GENL_HDRLEN);
+
+	a = (struct nlattr *)nla_find(attr, len, CTRL_ATTR_FAMILY_ID);
+	if (a == NULL || a->nla_len < NLA_HDRLEN + sizeof(uint16_t)) {
+		return -1;
+	}
+	memcpy(family, (char *)a + NLA_HDRLEN, sizeof(uint16_t));
+
+	a = (struct nlattr *)nla_find(attr, len, CTRL_ATTR_MCAST_GROUPS);
+	if (a == NULL) {
+		return -1;
+	}
+	// Each group is a nested set of attributes: its name and its id.
+	grp = (const struct nlattr *)((char *)a + NLA_HDRLEN);
+	left = a->nla_len - NLA_HDRLEN;
+	while (left >= NLA_HDRLEN && grp->nla_len >= NLA_HDRLEN && grp->nla_len <= left) {
+		const void *inner = (const char *)grp + NLA_HDRLEN;
+		size_t inner_len = grp->nla_len - NLA_HDRLEN;
+		const struct nlattr *name = nla_find(inner, inner_len, CTRL_ATTR_MCAST_GRP_NAME);
+		const struct nlattr *id = nla_find(inner, inner_len, CTRL_ATTR_MCAST_GRP_ID);
+
+		if (name != NULL && id != NULL && id->nla_len >= NLA_HDRLEN + sizeof(uint32_t) &&
+		    strncmp((const char *)name + NLA_HDRLEN, ACPI_EVENT_GROUP,
+			    name->nla_len - NLA_HDRLEN) == 0) {
+			memcpy(group, (const char *)id + NLA_HDRLEN, sizeof(uint32_t));
+			return 0;
+		}
+		if ((size_t)NLA_ALIGN(grp->nla_len) >= left) {
+			break;
+		}
+		left -= NLA_ALIGN(grp->nla_len);
+		grp = (const struct nlattr *)((const char *)grp + NLA_ALIGN(grp->nla_len));
+	}
+	return -1;
+}
+
+// open_power_buttons: Subscribes to the ACPI events of the kernel, among them
+// a press of the ACPI power button (x86), and asks the kernel for a SIGIO to
+// this process when one arrives. The events need no device node in /dev.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// 1 if it watches the power button, 0 if the kernel reports no ACPI events.
+int open_power_buttons(void) {
+	struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+	uint32_t group = 0;
+	int fd;
+
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+	if (fd < 0) {
+		return 0;
+	}
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+	    resolve_acpi_events(fd, &acpi_event_family, &group) < 0 ||
+	    setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group)) < 0 ||
+	    fcntl(fd, F_SETOWN, getpid()) < 0 ||
+	    fcntl(fd, F_SETFL, O_NONBLOCK | O_ASYNC) < 0) {
+		close(fd);
+		return 0;
+	}
+	DEBUG_PRINTF("Watching ACPI events, family %u group %u\n", acpi_event_family, group);
+	acpi_event_fd = fd;
+	return 1;
+}
+
+// power_button_pressed: Reads the pending ACPI events. It is
+// async-signal-safe, for the SIGIO handler.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// 1 if the power button was pressed, 0 otherwise.
+int power_button_pressed(void) {
+	char buf[4096] __attribute__((aligned(NLMSG_ALIGNTO)));
+	int pressed = 0;
+	ssize_t r;
+
+	if (acpi_event_fd < 0) {
+		return 0;
+	}
+	while ((r = recv(acpi_event_fd, buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+		struct nlmsghdr *n = (struct nlmsghdr *)buf;
+		size_t left = (size_t)r;
+
+		while (nlmsg_fits(n, left)) {
+			const struct nlattr *a = NULL;
+			const struct acpi_genl_event *ev;
+
+			if (n->nlmsg_type == acpi_event_family &&
+			    n->nlmsg_len >= NLMSG_LENGTH(GENL_HDRLEN)) {
+				a = nla_find((char *)NLMSG_DATA(n) + GENL_HDRLEN,
+					     n->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN),
+					     ACPI_GENL_ATTR_EVENT);
+			}
+			if (a != NULL && a->nla_len >= NLA_HDRLEN + sizeof(ev->device_class)) {
+				ev = (const struct acpi_genl_event *)((const char *)a + NLA_HDRLEN);
+				if (strncmp(ev->device_class, ACPI_POWER_BUTTON_CLASS,
+					    sizeof(ev->device_class)) == 0) {
+					pressed = 1;
+				}
+			}
+			if (NLMSG_ALIGN(n->nlmsg_len) >= left) {
+				break;
+			}
+			left -= NLMSG_ALIGN(n->nlmsg_len);
+			n = (struct nlmsghdr *)((char *)n + NLMSG_ALIGN(n->nlmsg_len));
+		}
+	}
+	return pressed;
 }

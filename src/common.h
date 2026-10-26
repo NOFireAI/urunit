@@ -81,6 +81,10 @@ int reboot_command(void);
 // Nonzero when URUNIT_DEFROUTE asks for a default route through the gateway.
 int wants_default_route(void);
 
+void request_poweroff(void);
+int open_power_buttons(void);
+int power_button_pressed(void);
+
 // configuration
 //
 // The urunit configuration (urunit.conf) and its parser, defined in

@@ -21,6 +21,8 @@ The key features of `urunit` are:
   `urunit` before the application when a container boot staged the binary at
   `/run/urunc/urunit`. Once the application exits the agent gets `SIGTERM`.
 - Running as the early init of a urunc generic container boot (Linux only).
+- Stopping the application with `SIGTERM` when the ACPI power button of the VM
+  is pressed (x86), and then powering the VM off instead of restarting it.
 
 ### Roles
 
