@@ -1329,6 +1329,54 @@ int reap(const pid_t child_pid, int *child_exitcode_ptr) {
 	return 0;
 }
 
+// The application, and whether a power button asked for the stop. The SIGIO
+// handler uses both.
+static volatile pid_t button_target = 0;
+static volatile sig_atomic_t power_off_requested = 0;
+
+// on_power_button: The SIGIO handler. A press of the power button asks the
+// application to stop with SIGTERM, as a container engine would, and the guest
+// then powers off instead of restarting. Once the application has exited,
+// what it left behind gets the SIGTERM instead.
+static void on_power_button(int sig) {
+	int saved_errno = errno;
+
+	(void)sig;
+	if (power_button_pressed()) {
+		power_off_requested = 1;
+		if (button_target <= 0 || kill(button_target, SIGTERM) < 0) {
+			kill(-1, SIGTERM);
+		}
+	}
+	errno = saved_errno;
+}
+
+// watch_power_buttons: Makes a press of the VM's power button stop the
+// application. As PID 1, urunit gets only the signals it handles, so the
+// handler goes in before the buttons can raise SIGIO. SA_RESTART keeps the
+// waitpid() of reap() going.
+//
+// Arguments:
+// No arguments.
+//
+// Return value:
+// No return value.
+static void watch_power_buttons(void) {
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_power_button;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGIO, &sa, NULL) < 0) {
+		perror("sigaction SIGIO");
+		return;
+	}
+	if (open_power_buttons() == 0) {
+		DEBUG_PRINT("No power button to watch\n");
+	}
+}
+
 int main(int argc, char *argv[]) {
 	pid_t app_pid;
 	int ret = 0;
@@ -1366,12 +1414,15 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	watch_power_buttons();
+
 	DEBUG_PRINT("Spawn the app\n");
 	ret = spawn_app(argc, argv, &app_pid);
 	if (ret) {
 		fprintf(stderr, "Could not spawn app\n");
 		return ret;
 	}
+	button_target = app_pid;
 
 	DEBUG_PRINT("Starting reaping loop\n");
 	while (1) {
@@ -1389,5 +1440,10 @@ int main(int argc, char *argv[]) {
 	DEBUG_PRINT("Exiting, will reboot in order to shutdown\n");
 	sync();
 	unmount_external();
+	// A power button exists only where the monitor can power the guest
+	// off, and Cloud Hypervisor would restart it on a reboot.
+	if (power_off_requested) {
+		request_poweroff();
+	}
 	request_reboot();
 }

@@ -17,6 +17,8 @@ The key features of `urunit` are:
 - Reading and setting the environment variables for an application from a file.
 - Reading and setting the execution environment configuration for a process from a file.
 - Reading and mounting attached block devices defined in the configuration file.
+- Stopping the application with `SIGTERM` when the ACPI power button of the VM
+  is pressed (x86), and then powering the VM off instead of restarting it.
 
 ## Building
 

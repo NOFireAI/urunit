@@ -70,5 +70,8 @@ int set_default_route(void);
 void unmount_external(void);
 int set_subreaper(void);
 void request_reboot(void);
+void request_poweroff(void);
+int open_power_buttons(void);
+int power_button_pressed(void);
 
 #endif // COMMON_H
