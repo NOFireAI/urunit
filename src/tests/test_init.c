@@ -563,6 +563,61 @@ static void test_init_missing_fstype(void)
 	CHECK(out == NULL);
 }
 
+// Scenario 3b: hull before the single binary boots its block rootfs with
+// rdinit=/init and no root=. With its /urunc-* files and a /dev/vda, init
+// takes /dev/vda as an ext4 root, as the script init did, and exports
+// /urunc-env. A Linux host, which appends no /urunc-* files, still has to
+// name its root, and so does hull when there is no disk.
+static void test_init_hull_block_no_root(void)
+{
+	char *argv[] = { "/init", NULL };
+	char **out = NULL;
+	int out_argc = 0;
+	int rc;
+
+	fake_reset();
+	fake_add("/dev/vda", "", 0);
+	fake_add("/urunc-cmd", "/bin/echo\nhello", 0);
+	fake_add("/urunc-env", "PATH=/usr/bin:/bin\nFOO=a=b", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 1, argv,
+		      "rdinit=/init console=ttyAMA0", &out_argc, &out);
+	CHECK_EQ_INT(rc, 0);
+	CHECK_CALLS(EARLY_MOUNTS,
+		    "mkdir_p /newroot 755",
+		    "mount /dev/vda /newroot ext4 0 -",
+		    "setenv PATH /usr/bin:/bin",
+		    "setenv FOO a=b",
+		    STAGE_BIN,
+		    DEFAULT_HOSTS,
+		    MOVE_MOUNTS,
+		    "switch_root /newroot");
+	if (rc == 0)
+		CHECK_ARGV(out, out_argc, "urunit", "/bin/echo", "hello");
+	CHECK(strstr(fake_console, "taking hull's block rootfs /dev/vda") != NULL);
+	free_argv(out);
+
+	// A Linux host: a disk, but none of hull's files.
+	fake_reset();
+	out = NULL;
+	fake_add("/dev/vda", "", 0);
+	fake_add("/urunit.conf", "UCS\0ARC:1\0ARV:/bin/true\0UCE\0", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 1, argv,
+		      "rdinit=/init console=ttyS0", &out_argc, &out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(out == NULL);
+	CHECK(strstr(fake_console, "no root= and rootfstype=") != NULL);
+
+	// hull's files, but no disk.
+	fake_reset();
+	out = NULL;
+	fake_add("/urunc-cmd", "/bin/true", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 1, argv,
+		      "rdinit=/init console=ttyAMA0", &out_argc, &out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(out == NULL);
+	CHECK(strstr(fake_console, "no root= and rootfstype=") != NULL);
+}
+
 // Scenario 4: Vz with a direct root, /urunc-env and DHCP resolver data.
 static void test_vz_direct(void)
 {
@@ -789,8 +844,11 @@ static void test_init_pnp(void)
 	free(r);
 }
 
-// Scenario 9: init mode leaves /urunc-env alone, as container-init did.
-static void test_init_ignores_env(void)
+// Scenario 9: init mode exports /urunc-env too. hull appends it for a
+// container boot in both modes, and it is the only place the image's
+// environment travels; a Linux host never appends it (its environment is in
+// urunit.conf).
+static void test_init_exports_env(void)
 {
 	char *argv[] = { "/init", "/bin/true", NULL };
 	char **out = NULL;
@@ -802,10 +860,10 @@ static void test_init_ignores_env(void)
 	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 2, argv,
 		      "root=fs0 rootfstype=virtiofs", &out_argc, &out);
 	CHECK_EQ_INT(rc, 0);
-	CHECK(strstr(fake_calls, "setenv") == NULL);
 	CHECK_CALLS(EARLY_MOUNTS,
 		    "mkdir_p /newroot 755",
 		    "mount fs0 /newroot virtiofs 0 -",
+		    "setenv FOO bar",
 		    STAGE_BIN,
 		    DEFAULT_HOSTS,
 		    MOVE_MOUNTS,
@@ -1283,6 +1341,7 @@ int run_init_tests(void)
 	test_init_command_from_config();
 	test_init_hull_block();
 	test_init_missing_fstype();
+	test_init_hull_block_no_root();
 	test_vz_direct();
 	test_default_hosts();
 	test_overlay_markers();
@@ -1296,7 +1355,7 @@ int run_init_tests(void)
 	test_vz_rootfs_fails();
 	test_init_cmdline_root();
 	test_init_pnp();
-	test_init_ignores_env();
+	test_init_exports_env();
 	test_init_env_switches();
 	test_init_parsers();
 	fake_reset();

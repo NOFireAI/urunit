@@ -44,7 +44,9 @@
 //   /proc /sys /dev    mount                     mount
 //   /urunc-epoch       set the clock             set the clock
 //   /urunc-rosetta     register Rosetta          register Rosetta
-//   root               root= of the cmdline      virtiofs tag rootfs
+//   root               root= of the cmdline, or  virtiofs tag rootfs
+//                      /dev/vda (ext4) when hull
+//                      named none
 //   tmpfs overlay      with /urunc-overlay       without /urunc-rootfs-direct,
 //                                                direct mount when it fails
 //   layered root       the disk /urunc-rootfs-lower names (by serial,
@@ -58,7 +60,7 @@
 //                      /urunc-hosts and          lines of /proc/net/pnp
 //                      /urunc-hostname
 //   default /etc/hosts when the image and hull provide none
-//   /urunc-env         ignored                   exported
+//   /urunc-env         exported                  exported
 //   /newroot/tmp       tmpfs 1777 with urunit.conf  chmod 1777
 //   /dev /proc /sys    moved into /newroot, with devpts and /dev/shm
 //   cgroup2            /newroot/sys/fs/cgroup, logged when it fails
@@ -998,6 +1000,21 @@ static int init_move_mounts(const struct init_ctx *c)
 	return 0;
 }
 
+// Tells whether this is hull's block rootfs with no root= on the kernel
+// command line: hull's per-instance files are in the initrd and the guest has
+// a /dev/vda. hull before the single binary named no root and relied on the
+// script init mounting /dev/vda, an ext4 image hull builds.
+static int init_hull_block(const struct init_ctx *c)
+{
+	if (c->ops->exists("/dev/vda") != 0)
+		return 0;
+	if (!init_exists(c, "/urunc-cmd") && !init_exists(c, "/urunc-env"))
+		return 0;
+	init_log(c, "no root= on the kernel command line; "
+		    "taking hull's block rootfs /dev/vda (ext4)");
+	return 1;
+}
+
 // Builds the argv for supervise_main: "urunit", the command and its
 // arguments. /urunc-cmd, one argument per line, replaces argv[1..], since
 // the kernel command line splits on whitespace. With neither, a urunit.conf
@@ -1229,6 +1246,15 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 				     "/urunc-rootfs-lower");
 			goto out;
 		}
+		if (root == NULL && fstype == NULL && flags == NULL &&
+		    init_hull_block(&c)) {
+			root = strdup("/dev/vda");
+			fstype = strdup("ext4");
+			if (root == NULL || fstype == NULL) {
+				init_log(&c, "out of memory");
+				goto out;
+			}
+		}
 		if (root == NULL || root[0] == '\0' || fstype == NULL ||
 		    fstype[0] == '\0') {
 			init_log(&c, "no root= and rootfstype= on the kernel "
@@ -1252,6 +1278,15 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	// the exports and stages the binary last, so the exports neither
 	// receive the chmod and the files nor hide the staged binary.
 	if (c.strict) {
+		size_t len;
+		char *env = init_slurp(&c, "/urunc-env", &len);
+
+		// Only hull appends /urunc-env; a Linux host carries the
+		// environment in urunit.conf.
+		if (env != NULL && init_env_export(ops, env) != 0)
+			init_log(&c, "could not export every line of "
+				     "/urunc-env");
+		free(env);
 		if (init_stage(&c))
 			goto out;
 		if (init_extra_mounts(&c))
