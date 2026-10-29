@@ -1000,7 +1000,9 @@ static int init_move_mounts(const struct init_ctx *c)
 
 // Builds the argv for supervise_main: "urunit", the command and its
 // arguments. /urunc-cmd, one argument per line, replaces argv[1..], since
-// the kernel command line splits on whitespace.
+// the kernel command line splits on whitespace. With neither, a urunit.conf
+// in the initrd carries the command (ARC/ARV), and the supervisor, started
+// with no arguments, takes it from there.
 static char **init_command(const struct init_ctx *c, int argc, char **argv,
 			   int *out_argc)
 {
@@ -1020,6 +1022,15 @@ static char **init_command(const struct init_ctx *c, int argc, char **argv,
 			n++;
 	} else if (argc > 1) {
 		n = (size_t)argc - 1;
+	} else if (init_exists(c, "/urunit.conf")) {
+		out = calloc(2, sizeof(*out));
+		if (out == NULL || (out[0] = strdup("urunit")) == NULL) {
+			init_log(c, "out of memory");
+			free(out);
+			return NULL;
+		}
+		*out_argc = 1;
+		return out;
 	}
 	if (n == 0 || (cmd != NULL ? cmd[0][0] : argv[1][0]) == '\0') {
 		init_log(c, "no command to run");

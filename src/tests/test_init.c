@@ -443,6 +443,37 @@ static void test_init_linux_virtiofs(void)
 	free_argv(out);
 }
 
+// Scenario 1b: urunc hands the command over in urunit.conf, not on the
+// kernel command line, so the supervisor starts with no arguments. Without
+// urunit.conf there is no command at all.
+static void test_init_command_from_config(void)
+{
+	char *argv[] = { "/init", NULL };
+	char **out = NULL;
+	int out_argc = 0;
+	int rc;
+
+	fake_reset();
+	fake_add("/urunit.conf", "UCS\0ARC:1\0ARV:/bin/true\0UCE\0", 0);
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 1, argv,
+		      "panic=-1 console=ttyS0 root=fs0 rw rootfstype=virtiofs "
+		      "rdinit=/init", &out_argc, &out);
+	CHECK_EQ_INT(rc, 0);
+	if (rc == 0)
+		CHECK_ARGV(out, out_argc, "urunit");
+	CHECK_EQ_STR(fake_console, "");
+	free_argv(out);
+
+	fake_reset();
+	out = NULL;
+	rc = init_run(&fake_ops, URUNIT_MODE_INIT, 1, argv,
+		      "panic=-1 console=ttyS0 root=fs0 rw rootfstype=virtiofs "
+		      "rdinit=/init", &out_argc, &out);
+	CHECK(rc != 0);
+	CHECK(out == NULL);
+	CHECK(strstr(fake_console, "no command to run") != NULL);
+}
+
 // Scenario 2: hull with hvi, a block root and every /urunc-* file.
 static void test_init_hull_block(void)
 {
@@ -1249,6 +1280,7 @@ int run_init_tests(void)
 	int start = harness_failures;
 
 	test_init_linux_virtiofs();
+	test_init_command_from_config();
 	test_init_hull_block();
 	test_init_missing_fstype();
 	test_vz_direct();
