@@ -64,6 +64,7 @@
 //   /newroot/tmp       tmpfs 1777 with urunit.conf  chmod 1777
 //   /dev /proc /sys    moved into /newroot, with devpts and /dev/shm
 //   cgroup2            /newroot/sys/fs/cgroup, logged when it fails
+//   URUNIT_POWEROFF    set with hull's /urunc-* files, unless already set
 //   command            /urunc-cmd or argv, bare names looked up in /newroot
 //   switch_root        /newroot                  /newroot
 
@@ -1000,15 +1001,30 @@ static int init_move_mounts(const struct init_ctx *c)
 	return 0;
 }
 
+// The block device behind a root= reaches devtmpfs a moment after the
+// kernel probed its disk, and on a virtio-pci disk (Vz) that can be after
+// init starts. Waits up to 3 s for path, and reports whether it is there.
+static int init_wait_dev(const struct init_ctx *c, const char *path)
+{
+	int t;
+
+	for (t = 0; t < 30; t++) {
+		if (c->ops->exists(path) == 0)
+			return 1;
+		c->ops->nap(100);
+	}
+	return 0;
+}
+
 // Tells whether this is hull's block rootfs with no root= on the kernel
 // command line: hull's per-instance files are in the initrd and the guest has
 // a /dev/vda. hull before the single binary named no root and relied on the
 // script init mounting /dev/vda, an ext4 image hull builds.
 static int init_hull_block(const struct init_ctx *c)
 {
-	if (c->ops->exists("/dev/vda") != 0)
-		return 0;
 	if (!init_exists(c, "/urunc-cmd") && !init_exists(c, "/urunc-env"))
+		return 0;
+	if (!init_wait_dev(c, "/dev/vda"))
 		return 0;
 	init_log(c, "no root= on the kernel command line; "
 		    "taking hull's block rootfs /dev/vda (ext4)");
@@ -1262,6 +1278,8 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 			goto out;
 		}
 		overlay = init_exists(&c, "/urunc-overlay");
+		if (strncmp(root, "/dev/", 5) == 0 && !init_wait_dev(&c, root))
+			init_log(&c, "%s did not appear", root);
 	} else {
 		overlay = !init_exists(&c, "/urunc-rootfs-direct");
 		if (init_layers(&c, overlay, &root, &fstype, &flags, &upper,
@@ -1315,6 +1333,14 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 
 	if (init_move_mounts(&c))
 		goto out;
+
+	// hull's container boots power the guest off when the application ends.
+	// A reset reboots a Virtualization.framework VM, so the command would
+	// run again and again; hvi exits on either. A Linux host sets
+	// URUNIT_POWEROFF itself where it needs it.
+	if (getenv("URUNIT_POWEROFF") == NULL &&
+	    (init_exists(&c, "/urunc-cmd") || init_exists(&c, "/urunc-env")))
+		ops->setenv("URUNIT_POWEROFF", "1");
 
 	out = init_command(&c, argc, argv, out_argc);
 	if (out == NULL)

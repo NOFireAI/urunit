@@ -484,6 +484,7 @@ static void test_init_hull_block(void)
 	int rc;
 
 	fake_reset();
+	fake_add("/dev/vda", "", 0);
 	fake_add("/urunit.conf", "UES:\nUEE:\n", 0);
 	fake_add("/urunc-overlay", "", 0);
 	fake_add("/urunc-mounts", "data\t/data\tro\n"
@@ -525,6 +526,7 @@ static void test_init_hull_block(void)
 		    CHMOD_NET,
 		    DEFAULT_HOSTS,
 		    MOVE_MOUNTS,
+		    "setenv URUNIT_POWEROFF 1",
 		    "switch_root /newroot");
 	if (rc == 0)
 		CHECK_ARGV(out, out_argc, "urunit", "/usr/bin/bash", "-c",
@@ -590,6 +592,7 @@ static void test_init_hull_block_no_root(void)
 		    STAGE_BIN,
 		    DEFAULT_HOSTS,
 		    MOVE_MOUNTS,
+		    "setenv URUNIT_POWEROFF 1",
 		    "switch_root /newroot");
 	if (rc == 0)
 		CHECK_ARGV(out, out_argc, "urunit", "/bin/echo", "hello");
@@ -607,7 +610,7 @@ static void test_init_hull_block_no_root(void)
 	CHECK(out == NULL);
 	CHECK(strstr(fake_console, "no root= and rootfstype=") != NULL);
 
-	// hull's files, but no disk.
+	// hull's files, but no disk: it waits for one, then refuses.
 	fake_reset();
 	out = NULL;
 	fake_add("/urunc-cmd", "/bin/true", 0);
@@ -615,6 +618,7 @@ static void test_init_hull_block_no_root(void)
 		      "rdinit=/init console=ttyAMA0", &out_argc, &out);
 	CHECK_EQ_INT(rc, 1);
 	CHECK(out == NULL);
+	CHECK(strstr(fake_calls, "nap 100") != NULL);
 	CHECK(strstr(fake_console, "no root= and rootfstype=") != NULL);
 }
 
@@ -653,6 +657,7 @@ static void test_vz_direct(void)
 		    DEFAULT_HOSTS,
 		    STAGE_BIN,
 		    MOVE_MOUNTS,
+		    "setenv URUNIT_POWEROFF 1",
 		    "switch_root /newroot");
 	w = fake_written("/newroot/etc/resolv.conf");
 	CHECK(w != NULL);
@@ -720,6 +725,7 @@ static void test_vz_full(void)
 		    "mount state /newroot/run virtiofs 0 -",
 		    STAGE_BIN,
 		    MOVE_MOUNTS,
+		    "setenv URUNIT_POWEROFF 1",
 		    "switch_root /newroot");
 	if (rc == 0)
 		CHECK_ARGV(out, out_argc, "urunit", "/usr/bin/bash", "-c",
@@ -867,6 +873,7 @@ static void test_init_exports_env(void)
 		    STAGE_BIN,
 		    DEFAULT_HOSTS,
 		    MOVE_MOUNTS,
+		    "setenv URUNIT_POWEROFF 1",
 		    "switch_root /newroot");
 	CHECK(strstr(fake_console, "container-init: no urunit.conf") != NULL);
 	free_argv(out);
