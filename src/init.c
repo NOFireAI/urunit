@@ -71,11 +71,15 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
+#include <unistd.h>
 
 #include "sysops.h"
 #include "urunit.h"
@@ -1197,6 +1201,158 @@ out:
 	return rc;
 }
 
+// The in-guest telemetry producer (vmi's telem-capture), started before the
+// workload when the kernel offers the export ring at /dev/telem. It is the
+// source of every rich event the sidecar sees; without it the host observes
+// the boundary alone. It comes from one of two places: the bytes a build with
+// TELEM_CAPTURE embedded in this binary (urunit_telem_capture_blob, weak, so a
+// build without them leaves the symbols null), or /vmi-telem-capture in the
+// initrd. Either way it runs from a memfd or the initrd file through fexecve,
+// as a child of PID 1 that the reaping loop collects, while this initramfs is
+// still the root: switch_root deletes the file, the running process survives.
+//
+// It reads the kernel's BTF from /sys and the tracepoint layouts from tracefs,
+// so tracefs is mounted first. It reports readiness with one byte on the pipe
+// it is given (--ready-fd); the init waits for that byte, bounded, so the
+// workload starts under capture, and says so when the producer died or stalled
+// instead. A kernel without /dev/telem boots on without any of this, so one
+// initrd serves the stock and the introspecting kernel.
+extern const unsigned char urunit_telem_capture_blob[] __attribute__((weak));
+extern const unsigned char urunit_telem_capture_blob_end[] __attribute__((weak));
+
+#define INIT_CAPTURE_FILE "/vmi-telem-capture"
+#define INIT_CAPTURE_DEV "/dev/telem"
+#define INIT_TRACEFS "/sys/kernel/tracing"
+// How long the init waits for the producer's readiness. Attaching takes some
+// tens of milliseconds; a second is already a sign of trouble, and a boot
+// should not hang on a capture that never comes.
+#define INIT_CAPTURE_READY_MS 3000
+
+int init_capture_wait_ready(int fd, int timeout_ms)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	unsigned char byte;
+	ssize_t n;
+	int rc;
+
+	do {
+		rc = poll(&pfd, 1, timeout_ms);
+	} while (rc < 0 && errno == EINTR);
+	if (rc <= 0)
+		return -1;
+	do {
+		n = read(fd, &byte, 1);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0)
+		return -1;
+	return n == 1;
+}
+
+// Returns a descriptor to fexecve the producer from, or -1 with errno set
+// when there is none: a memfd holding the embedded bytes, else the initrd
+// file. *embedded says which.
+static int init_capture_fd(const struct init_ctx *c, int *embedded)
+{
+	const unsigned char *p = urunit_telem_capture_blob;
+	size_t left;
+	int fd;
+
+	*embedded = p != NULL && urunit_telem_capture_blob_end > p;
+	if (!*embedded) {
+		if (c->ops->access_x(INIT_CAPTURE_FILE) != 0)
+			return -1;
+		return open(INIT_CAPTURE_FILE, O_RDONLY | O_CLOEXEC);
+	}
+	left = (size_t)(urunit_telem_capture_blob_end - p);
+	fd = memfd_create("vmi-telem-capture", MFD_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	while (left > 0) {
+		ssize_t n = write(fd, p, left);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			close(fd);
+			return -1;
+		}
+		p += n;
+		left -= (size_t)n;
+	}
+	return fd;
+}
+
+static void init_start_capture(const struct init_ctx *c)
+{
+	char ready_arg[16];
+	char *argv[] = { "vmi-telem-capture", "--ready-fd", ready_arg, NULL };
+	int ready[2];
+	int embedded;
+	int fd;
+	int kmsg;
+	pid_t pid;
+
+	if (c->ops->exists(INIT_CAPTURE_DEV) != 0)
+		return;
+	fd = init_capture_fd(c, &embedded);
+	if (fd < 0) {
+		if (errno != ENOENT)
+			init_log(c, "could not stage the telemetry producer: %s",
+				 strerror(errno));
+		return;
+	}
+	if (c->ops->mount("tracefs", INIT_TRACEFS, "tracefs",
+			  MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) != 0 &&
+	    errno != EBUSY)
+		init_log(c, "could not mount tracefs: %s", strerror(errno));
+	if (pipe2(ready, O_CLOEXEC) != 0) {
+		init_log(c, "could not make the readiness pipe: %s",
+			 strerror(errno));
+		close(fd);
+		return;
+	}
+	pid = fork();
+	if (pid < 0) {
+		init_log(c, "could not fork for the telemetry producer: %s",
+			 strerror(errno));
+		close(ready[0]);
+		close(ready[1]);
+		close(fd);
+		return;
+	}
+	if (pid == 0) {
+		// The write end crosses the exec; the agent closes it once ready.
+		fcntl(ready[1], F_SETFD, 0);
+		snprintf(ready_arg, sizeof(ready_arg), "%d", ready[1]);
+		kmsg = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+		if (kmsg >= 0) {
+			dup2(kmsg, 1);
+			dup2(kmsg, 2);
+		}
+		fexecve(fd, argv, environ);
+		_exit(127);
+	}
+	close(ready[1]);
+	close(fd);
+	switch (init_capture_wait_ready(ready[0], INIT_CAPTURE_READY_MS)) {
+	case 1:
+		init_log(c, "telemetry producer ready (pid %d, %s)", (int)pid,
+			 embedded ? "embedded" : INIT_CAPTURE_FILE);
+		break;
+	case 0:
+		init_log(c, "telemetry producer (pid %d) exited before it was "
+			     "ready; the guest runs without the rich channel",
+			 (int)pid);
+		break;
+	default:
+		init_log(c, "telemetry producer (pid %d) not ready after %d ms; "
+			     "going on without waiting", (int)pid,
+			 INIT_CAPTURE_READY_MS);
+		break;
+	}
+	close(ready[0]);
+}
+
 int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 	     char **argv, const char *cmdline, int *out_argc,
 	     char ***out_argv)
@@ -1233,6 +1389,9 @@ int init_run(const struct sysops *ops, enum urunit_mode mode, int argc,
 
 	// The clock comes first, before anything checks a certificate.
 	init_set_clock(&c);
+	// Then the telemetry producer, so the root mount and the workload are
+	// already under capture.
+	init_start_capture(&c);
 	if (init_rosetta(&c))
 		return 1;
 

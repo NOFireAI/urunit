@@ -52,6 +52,12 @@ struct sysops {
 
 extern const struct sysops sysops_real;
 
+// Waits up to timeout_ms for the telemetry producer's readiness byte on fd,
+// the read end of the pipe whose write end the producer was given. Returns 1
+// when the byte arrived, 0 when the producer closed the pipe without writing
+// it (it exited first), and -1 when the wait timed out or failed.
+int init_capture_wait_ready(int fd, int timeout_ms);
+
 // Runs the early init sequence of mode through ops. cmdline is the text of
 // /proc/cmdline. When it is NULL, init_run reads the file through
 // ops->read_file. On success it returns 0 and sets *out_argv to a heap

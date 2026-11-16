@@ -48,6 +48,19 @@ URUNIT_SRC := ${SOURCE_DIR}/urunit.c ${SOURCE_DIR}/main.c ${SOURCE_DIR}/mode.c \
 # Header files
 URUNIT_HDR := $(wildcard ${SOURCE_DIR}/*.h)
 
+#? TELEM_CAPTURE a prebuilt in-guest telemetry producer (vmi's telem-capture,
+#  static, for the target architecture) to embed in urunit. The early init then
+#  starts it from memory before the workload, when the kernel offers /dev/telem,
+#  so an introspecting initrd is one file. Unset, the init starts
+#  /vmi-telem-capture from the initrd when that exists, and nothing otherwise.
+TELEM_CAPTURE ?=
+ifneq ($(TELEM_CAPTURE),)
+    TELEM_CAPTURE_BLOB := $(BUILD_DIR)/telem_capture_blob.o
+    URUNIT_OBJ         := $(TELEM_CAPTURE_BLOB)
+else
+    URUNIT_OBJ         :=
+endif
+
 # Unit tests: every source except urunit.c, plus src/tests. Linux only.
 TEST_SRC        := $(wildcard ${SOURCE_DIR}/tests/*.c)
 TEST_HDR        := $(wildcard ${SOURCE_DIR}/tests/*.h)
@@ -140,17 +153,28 @@ ifneq ($(TARGET_OS),Linux)
 endif
 	$(CC) $(CFLAGS) -I${SOURCE_DIR} $(filter-out ${SOURCE_DIR}/urunit.c,$(URUNIT_SRC)) $(TEST_SRC) -o $@
 
-$(URUNIT_BIN_DYNAMIC): $(URUNIT_SRC) $(URUNIT_HDR) | prepare
-	$(CC) $(CFLAGS) $(URUNIT_SRC) $(LDFLAGS) -o $@
+# The embedded producer: the file's bytes in .rodata, between two symbols
+# init.c declares weak, so a build without TELEM_CAPTURE leaves them null and
+# the init falls back to the file in the initrd. .incbin keeps the bytes as they
+# are; --noexecstack says what the assembler cannot know about them.
+ifneq ($(TELEM_CAPTURE),)
+$(TELEM_CAPTURE_BLOB): $(TELEM_CAPTURE) | prepare
+	printf '\t.section .rodata\n\t.balign 16\n\t.globl urunit_telem_capture_blob\nurunit_telem_capture_blob:\n\t.incbin "%s"\n\t.globl urunit_telem_capture_blob_end\nurunit_telem_capture_blob_end:\n' \
+		"$(TELEM_CAPTURE)" > $(BUILD_DIR)/telem_capture_blob.S
+	$(CC) -c -Wa,--noexecstack $(BUILD_DIR)/telem_capture_blob.S -o $@
+endif
 
-$(URUNIT_BIN_DYNAMIC_DEBUG): $(URUNIT_SRC) $(URUNIT_HDR) | prepare
-	$(CC) $(CFLAGS) -DDEBUG $(URUNIT_SRC) $(LDFLAGS) -o $@
+$(URUNIT_BIN_DYNAMIC): $(URUNIT_SRC) $(URUNIT_HDR) $(URUNIT_OBJ) | prepare
+	$(CC) $(CFLAGS) $(URUNIT_SRC) $(URUNIT_OBJ) $(LDFLAGS) -o $@
 
-$(URUNIT_BIN_STATIC): $(URUNIT_SRC) $(URUNIT_HDR) | prepare
-	$(CC) $(CFLAGS) $(URUNIT_SRC) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@
+$(URUNIT_BIN_DYNAMIC_DEBUG): $(URUNIT_SRC) $(URUNIT_HDR) $(URUNIT_OBJ) | prepare
+	$(CC) $(CFLAGS) -DDEBUG $(URUNIT_SRC) $(URUNIT_OBJ) $(LDFLAGS) -o $@
 
-$(URUNIT_BIN_STATIC_DEBUG): $(URUNIT_SRC) $(URUNIT_HDR) | prepare
-	$(CC) $(CFLAGS) -DDEBUG $(URUNIT_SRC) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@
+$(URUNIT_BIN_STATIC): $(URUNIT_SRC) $(URUNIT_HDR) $(URUNIT_OBJ) | prepare
+	$(CC) $(CFLAGS) $(URUNIT_SRC) $(URUNIT_OBJ) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@
+
+$(URUNIT_BIN_STATIC_DEBUG): $(URUNIT_SRC) $(URUNIT_HDR) $(URUNIT_OBJ) | prepare
+	$(CC) $(CFLAGS) -DDEBUG $(URUNIT_SRC) $(URUNIT_OBJ) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@
 
 ## install Install urunit in PREFIX
 .PHONY: install
