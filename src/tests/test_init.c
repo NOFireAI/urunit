@@ -1340,10 +1340,30 @@ static void test_init_parsers(void)
 	init_free_mounts(m);
 }
 
+// The readiness wait: the byte, the producer exiting without it (end of
+// file), and nothing at all within the timeout.
+static void test_capture_wait_ready(void)
+{
+	int fds[2];
+
+	CHECK(pipe(fds) == 0);
+	CHECK(write(fds[1], "1", 1) == 1);
+	CHECK(init_capture_wait_ready(fds[0], 1000) == 1);
+	close(fds[1]);
+	CHECK(init_capture_wait_ready(fds[0], 1000) == 0);
+	close(fds[0]);
+
+	CHECK(pipe(fds) == 0);
+	CHECK(init_capture_wait_ready(fds[0], 20) == -1);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 int run_init_tests(void)
 {
 	int start = harness_failures;
 
+	test_capture_wait_ready();
 	test_init_linux_virtiofs();
 	test_init_command_from_config();
 	test_init_hull_block();

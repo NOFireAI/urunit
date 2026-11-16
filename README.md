@@ -49,6 +49,25 @@ virtio-blk serial, and every failure ends the boot.
 A container boot initrd needs only `/urunit`, with `/init` and `/vz-init` as
 symlinks to it. On FreeBSD `urunit` is always the supervisor.
 
+### In-guest telemetry producer
+
+An introspecting guest runs a telemetry producer (vmi's `telem-capture`) from
+boot, which fills the export ring the kernel offers at `/dev/telem`. Both
+early-init roles start it before the root is mounted, when that device exists,
+from one of two places:
+
+- the bytes embedded in `urunit` by `make static TELEM_CAPTURE=<path>`, a
+  prebuilt static producer for the target architecture, run from a `memfd`;
+  the initrd then stays one file;
+- else `/vmi-telem-capture` in the initrd.
+
+The producer is a child of PID 1, reaped like every other. It is given
+`--ready-fd` on a pipe and the init waits up to three seconds for its readiness
+byte, so the workload starts under capture; a producer that exits first or
+stalls is logged and the boot goes on without the rich channel. A kernel
+without `/dev/telem` boots as before, so the same initrd serves a stock and an
+introspecting kernel.
+
 ## Building
 
 Building `urunit` is as simple as running `make`, but make sure that `make` and
